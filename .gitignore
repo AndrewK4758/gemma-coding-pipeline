@@ -1,0 +1,29 @@
+# Local-only living training glossary and agent rule files (never tracked in git)
+TRAINING_GLOSSARY.local.md
+*.local.md
+GEMINI.md
+AGENTS.md
+CLAUDE.md
+.gemini/
+.agents/
+.claude/
+
+# Virtual environments & Python cache
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+
+# Datasets, checkpoints, TensorBoard runs & GGUF exports
+data/raw/
+data/processed/
+data/cache/
+checkpoints/
+runs/
+outputs/
+*.gguf
+*.imatrix
+*.safetensors
+*.bin
