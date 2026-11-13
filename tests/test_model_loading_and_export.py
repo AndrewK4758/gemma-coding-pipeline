@@ -272,6 +272,42 @@ class TestModelLoadingAndExport(unittest.TestCase):
             ids = torch.randint(0, 64, (1, 4))
             peft_dst(input_ids=ids, labels=ids).loss.backward()
 
+    def test_backward_dpo_pair_loss_matches_joint_backward_and_runs_sequentially(self) -> None:
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from train.dpo_compiler import backward_dpo_pair_loss
+
+        torch.manual_seed(0)
+        lin_ref = nn.Linear(4, 1)
+        lin_seq = nn.Linear(4, 1)
+        lin_seq.load_state_dict(lin_ref.state_dict())
+        xc = torch.randn(1, 4)
+        xr = torch.randn(1, 4)
+        beta, grad_accum, ref_c, ref_r = 0.1, 4, -1.25, -2.5
+
+        c_joint = lin_ref(xc).sum()
+        r_joint = lin_ref(xr).sum()
+        margin_joint = beta * ((c_joint - ref_c) - (r_joint - ref_r))
+        loss_joint = -F.logsigmoid(margin_joint).mean()
+        (loss_joint / grad_accum).backward()
+
+        order: list[str] = []
+        c_seq = lin_seq(xc).sum()
+        r_seq = lin_seq(xr).sum()
+        c_seq.register_hook(lambda _g: order.append("chosen"))
+        r_seq.register_hook(lambda _g: order.append("rejected"))
+
+        loss_seq, c_rew, r_rew, margin_seq = backward_dpo_pair_loss(
+            c_seq, r_seq, ref_c, ref_r, beta=beta, grad_accum_steps=grad_accum
+        )
+        self.assertEqual(order, ["rejected", "chosen"])
+        self.assertAlmostEqual(float(loss_seq.detach()), float(loss_joint.detach()), places=6)
+        self.assertAlmostEqual(float(margin_seq.detach()), float(margin_joint.detach()), places=6)
+        self.assertAlmostEqual(float(c_rew.detach()), float((beta * (c_joint - ref_c)).detach()), places=6)
+        self.assertAlmostEqual(float(r_rew.detach()), float((beta * (r_joint - ref_r)).detach()), places=6)
+        for p_ref, p_seq in zip(lin_ref.parameters(), lin_seq.parameters()):
+            self.assertTrue(torch.allclose(p_ref.grad, p_seq.grad, atol=1e-6))
+
 
 if __name__ == "__main__":
     unittest.main()
