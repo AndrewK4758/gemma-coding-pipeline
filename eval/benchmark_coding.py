@@ -45,23 +45,13 @@ from train.dpo_compiler import _encode_padded_tensors, compute_chunked_sequence_
 from train.model_loader import (
     DEFAULT_MODEL_ID,
     get_input_device,
+    load_peft_adapter_preserving_sharding,
     load_sharded_base_model,
     query_dual_gpu_vram,
     resolve_model_topology,
 )
 
 # Held-out coding prompts live in eval/held_out_prompts.py (5 TS, 5 Go, 5 C#, 5 C/C++).
-
-
-def _align_peft_devices(model: PeftModel) -> None:
-    """Ensure all multi-adapter LoRA parameters sit on the same GPU and bfloat16 dtype as their base_layer."""
-    for module in model.modules():
-        if hasattr(module, "base_layer") and hasattr(module.base_layer, "weight"):
-            dev = module.base_layer.weight.device
-            if hasattr(module, "lora_A"):
-                module.lora_A.to(device=dev, dtype=torch.bfloat16)
-            if hasattr(module, "lora_B"):
-                module.lora_B.to(device=dev, dtype=torch.bfloat16)
 
 
 def load_multi_adapter_benchmark_model(
@@ -75,9 +65,8 @@ def load_multi_adapter_benchmark_model(
         topo, tokenizer_source=dpo_adapter_dir, load_in_4bit=load_in_4bit, console=console
     )
 
-    peft_model = PeftModel.from_pretrained(base_model, str(sft_adapter_dir), adapter_name="sft", is_trainable=False)
-    peft_model.load_adapter(str(dpo_adapter_dir), adapter_name="dpo", is_trainable=False)
-    _align_peft_devices(peft_model)
+    peft_model = load_peft_adapter_preserving_sharding(base_model, sft_adapter_dir, adapter_name="sft", is_trainable=False)
+    peft_model = load_peft_adapter_preserving_sharding(peft_model, dpo_adapter_dir, adapter_name="dpo", is_trainable=False)
     peft_model.eval()
     return peft_model, tokenizer, {
         "resolved_model_id": resolved_id, "model_type": model_type, "load_in_4bit": load_in_4bit,

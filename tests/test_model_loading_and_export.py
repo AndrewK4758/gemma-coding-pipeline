@@ -241,6 +241,37 @@ class TestModelLoadingAndExport(unittest.TestCase):
             ):
                 self.assertEqual(resolve_base_snapshot_dir("google/gemma-4-26B-A4B-it"), complete)
 
+    def test_load_peft_adapter_preserving_sharding_skips_redispatch_and_preserves_hooks(self) -> None:
+        from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+        from peft import LoraConfig, get_peft_model
+        from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+        from train.model_loader import load_peft_adapter_preserving_sharding
+
+        cfg = Gemma4TextConfig(
+            hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2,
+            num_key_value_heads=1, head_dim=16, global_head_dim=16, vocab_size=64,
+            hidden_size_per_layer_input=0, num_kv_shared_layers=0, layer_types=["full_attention"],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            m_src = Gemma4ForCausalLM(cfg).to(dtype=torch.bfloat16)
+            peft_src = get_peft_model(
+                m_src, LoraConfig(r=4, lora_alpha=8, task_type="CAUSAL_LM", target_modules=["q_proj", "v_proj"])
+            )
+            peft_src.save_pretrained(tmp)
+
+            m_dst = Gemma4ForCausalLM(cfg).to(dtype=torch.bfloat16)
+            add_hook_to_module(m_dst.model.layers[0], AlignDevicesHook(execution_device="cpu", place_submodules=False))
+            orig_hmap = {"model.vision_tower": "cpu", "model.layers.0": "cpu"}
+            m_dst.hf_device_map = dict(orig_hmap)
+
+            with mock.patch("peft.peft_model.dispatch_model", side_effect=AssertionError("must not redispatch")):
+                peft_dst = load_peft_adapter_preserving_sharding(m_dst, tmp, adapter_name="default", is_trainable=True)
+
+            self.assertTrue(hasattr(peft_dst.get_base_model().model.layers[0], "_hf_hook"))
+            self.assertEqual(peft_dst.get_base_model().hf_device_map, orig_hmap)
+            ids = torch.randint(0, 64, (1, 4))
+            peft_dst(input_ids=ids, labels=ids).loss.backward()
+
 
 if __name__ == "__main__":
     unittest.main()

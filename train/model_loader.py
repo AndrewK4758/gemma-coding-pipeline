@@ -27,9 +27,7 @@ import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from rich.console import Console
 from rich.table import Table
-from transformers import (
-    AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel, PreTrainedTokenizerBase,
-)
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel, PreTrainedTokenizerBase
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from train.moe_quant import finalize_disk_offloaded_moe_layers, quantize_gemma4_moe_experts_in_place
@@ -178,12 +176,11 @@ def install_chunked_causal_lm_loss(base_model: PreTrainedModel, chunk_size: int 
 
 def make_multigpu_rng_context_fn() -> Callable[[], tuple[Any, Any]]:
     """Snapshot and restore CUDA RNG across ALL visible GPUs for cross-device gradient checkpointing."""
-
     def _context_fn() -> tuple[Any, Any]:
-        saved_states: dict[int, torch.Tensor] = {}
-        if torch.cuda.is_available():
-            for dev_idx in range(torch.cuda.device_count()):
-                saved_states[dev_idx] = torch.cuda.get_rng_state(dev_idx)
+        saved_states = (
+            {d: torch.cuda.get_rng_state(d) for d in range(torch.cuda.device_count())}
+            if torch.cuda.is_available() else {}
+        )
 
         @contextlib.contextmanager
         def _forward_ctx():
@@ -194,17 +191,16 @@ def make_multigpu_rng_context_fn() -> Callable[[], tuple[Any, Any]]:
             if not saved_states:
                 yield
                 return
-            prev_states = {dev_idx: torch.cuda.get_rng_state(dev_idx) for dev_idx in saved_states}
-            for dev_idx, st in saved_states.items():
-                torch.cuda.set_rng_state(st, dev_idx)
+            prev_states = {d: torch.cuda.get_rng_state(d) for d in saved_states}
+            for d, st in saved_states.items():
+                torch.cuda.set_rng_state(st, d)
             try:
                 yield
             finally:
-                for dev_idx, st in prev_states.items():
-                    torch.cuda.set_rng_state(st, dev_idx)
+                for d, st in prev_states.items():
+                    torch.cuda.set_rng_state(st, d)
 
         return _forward_ctx(), _recompute_ctx()
-
     return _context_fn
 
 
@@ -219,14 +215,10 @@ def query_dual_gpu_vram() -> dict[str, dict[str, float | str]]:
         used_driver_mib, total_mib = (total_b - free_b) / (1024**2), total_b / (1024**2)
         stats[f"cuda:{idx}"] = {
             "name": torch.cuda.get_device_properties(idx).name,
-            "allocated_mib": round(alloc_mib, 1),
-            "reserved_mib": round(torch.cuda.memory_reserved(idx) / (1024**2), 1),
+            "allocated_mib": round(alloc_mib, 1), "reserved_mib": round(torch.cuda.memory_reserved(idx) / (1024**2), 1),
             "peak_allocated_mib": round(torch.cuda.max_memory_allocated(idx) / (1024**2), 1),
-            "driver_used_mib": round(used_driver_mib, 1),
-            "total_mib": round(total_mib, 1),
-            "allocated_gib": round(alloc_mib / 1024.0, 2),
-            "driver_used_gib": round(used_driver_mib / 1024.0, 2),
-            "total_gib": round(total_mib / 1024.0, 2),
+            "driver_used_mib": round(used_driver_mib, 1), "total_mib": round(total_mib, 1),
+            "allocated_gib": round(alloc_mib / 1024.0, 2), "driver_used_gib": round(used_driver_mib / 1024.0, 2), "total_gib": round(total_mib / 1024.0, 2),
         }
     return stats
 
@@ -258,9 +250,7 @@ def get_input_device(model: nn.Module) -> torch.device:
 
 
 def resolve_model_topology(
-    model_id: str = DEFAULT_MODEL_ID,
-    attn_implementation: str = "sdpa",
-    load_in_4bit: bool = False,
+    model_id: str = DEFAULT_MODEL_ID, attn_implementation: str = "sdpa", load_in_4bit: bool = False
 ) -> dict[str, Any]:
     """Inspect HuggingFace config and compute asymmetric dual-GPU device_map and MoE flags."""
     resolved_id = resolve_checkpoint_id(model_id)
@@ -268,8 +258,7 @@ def resolve_model_topology(
     model_type = getattr(cfg, "model_type", "gemma4")
     text_cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
     num_layers = int(getattr(text_cfg, "num_hidden_layers", GEMMA_NUM_LAYERS) or GEMMA_NUM_LAYERS)
-    num_experts = getattr(text_cfg, "num_experts", 0) or 0
-    is_moe = bool(getattr(text_cfg, "enable_moe_block", False) or num_experts > 1)
+    is_moe = bool(getattr(text_cfg, "enable_moe_block", False) or (getattr(text_cfg, "num_experts", 0) or 0) > 1)
     has_audio = getattr(cfg, "audio_config", None) is not None
     has_ple = bool(getattr(text_cfg, "hidden_size_per_layer_input", 0) or 0)
     split_layer = 21 if num_layers <= 30 else PRIMARY_GPU_MAX_LAYER
@@ -278,27 +267,20 @@ def resolve_model_topology(
         offload_multimodal=bool(load_in_4bit or is_moe), offload_experts_to_disk=bool(load_in_4bit and is_moe),
         include_audio=has_audio, include_per_layer=has_ple,
     )
-    if model_type == "gemma4" and attn_implementation == "sdpa":
-        attn_arg: str | dict[str, str] = {"text_config": attn_implementation, "vision_config": attn_implementation}
-        if has_audio:
-            attn_arg["audio_config"] = "eager"
-    else:
-        attn_arg = attn_implementation
-    return {
-        "resolved_id": resolved_id, "model_type": model_type, "num_layers": num_layers,
-        "is_moe": is_moe, "split_layer": split_layer, "device_map": device_map, "attn_arg": attn_arg,
-    }
+    attn_arg: str | dict[str, str] = (
+        {"text_config": attn_implementation, "vision_config": attn_implementation, **({"audio_config": "eager"} if has_audio else {})}
+        if model_type == "gemma4" and attn_implementation == "sdpa" else attn_implementation
+    )
+    return {"resolved_id": resolved_id, "model_type": model_type, "num_layers": num_layers, "is_moe": is_moe, "split_layer": split_layer, "device_map": device_map, "attn_arg": attn_arg}
 
 
 def load_sharded_base_model(
-    topo: dict[str, Any],
-    tokenizer_source: str | os.PathLike[str] | None = None,
-    load_in_4bit: bool = False,
-    console: Console | None = None,
+    topo: dict[str, Any], tokenizer_source: str | os.PathLike[str] | None = None, load_in_4bit: bool = False, console: Console | None = None
 ) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
     """Load base checkpoint across dual GPUs, streaming disk-offloaded MoE experts into 4-bit NF4 without swap."""
-    resolved_id, num_layers = topo["resolved_id"], topo["num_layers"]
-    is_moe, split_layer, device_map, attn_arg = topo["is_moe"], topo["split_layer"], topo["device_map"], topo["attn_arg"]
+    resolved_id, num_layers, is_moe, split_layer, device_map, attn_arg = (
+        topo["resolved_id"], topo["num_layers"], topo["is_moe"], topo["split_layer"], topo["device_map"], topo["attn_arg"]
+    )
     tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_source) if tokenizer_source else resolved_id)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -324,6 +306,35 @@ def load_sharded_base_model(
     return base_model, tokenizer
 
 
+def load_peft_adapter_preserving_sharding(
+    model: PreTrainedModel | PeftModel,
+    adapter_path: str | os.PathLike[str],
+    adapter_name: str = "default",
+    is_trainable: bool = False,
+) -> PeftModel:
+    """Attach or load a PEFT adapter onto an already-sharded model without PEFT stripping hooks or re-dispatching."""
+    base = model.get_base_model() if isinstance(model, PeftModel) else model
+    saved_hmap = getattr(base, "hf_device_map", None)
+    if isinstance(saved_hmap, dict):
+        base.hf_device_map = {k: v for k, v in saved_hmap.items() if v not in ("cpu", "disk")}
+    try:
+        if isinstance(model, PeftModel):
+            model.load_adapter(str(adapter_path), adapter_name=adapter_name, is_trainable=is_trainable)
+            peft_model = model
+        else:
+            peft_model = PeftModel.from_pretrained(model, str(adapter_path), adapter_name=adapter_name, is_trainable=is_trainable)
+    finally:
+        if isinstance(saved_hmap, dict):
+            base.hf_device_map = saved_hmap
+    for mod in peft_model.modules():
+        if hasattr(mod, "base_layer") and hasattr(mod.base_layer, "weight"):
+            dev = mod.base_layer.weight.device
+            for attr in ("lora_A", "lora_B"):
+                if hasattr(mod, attr):
+                    getattr(mod, attr).to(device=dev, dtype=torch.bfloat16)
+    return peft_model
+
+
 def load_sharded_lora_model_and_tokenizer(
     model_id: str = DEFAULT_MODEL_ID,
     lora_r: int = 32,
@@ -337,38 +348,25 @@ def load_sharded_lora_model_and_tokenizer(
     """Load base Gemma checkpoint (bfloat16 or QLoRA 4-bit NF4) across cuda:1 + cuda:0 with PEFT LoRA."""
     console = console or Console()
     topo = resolve_model_topology(model_id=model_id, attn_implementation=attn_implementation, load_in_4bit=load_in_4bit)
-    resolved_id, model_type, num_layers = topo["resolved_id"], topo["model_type"], topo["num_layers"]
-    is_moe, attn_arg = topo["is_moe"], topo["attn_arg"]
+    resolved_id, model_type, num_layers, is_moe, attn_arg = topo["resolved_id"], topo["model_type"], topo["num_layers"], topo["is_moe"], topo["attn_arg"]
     quant_label = "4-bit NF4 QLoRA" if load_in_4bit else "bfloat16"
-    console.print(
-        f"[bold cyan]Loading base model:[/bold cyan] [green]{resolved_id}[/green] "
-        f"(model_type={model_type}, layers={num_layers}, moe={is_moe}, precision={quant_label}, attn={attn_arg})"
-    )
-    base_model, tokenizer = load_sharded_base_model(
-        topo, tokenizer_source=adapter_path, load_in_4bit=load_in_4bit, console=console
-    )
+    console.print(f"[bold cyan]Loading base model:[/bold cyan] [green]{resolved_id}[/green] (model_type={model_type}, layers={num_layers}, moe={is_moe}, precision={quant_label}, attn={attn_arg})")
+    base_model, tokenizer = load_sharded_base_model(topo, tokenizer_source=adapter_path, load_in_4bit=load_in_4bit, console=console)
 
     for param in base_model.parameters():
         param.requires_grad_(False)
-
     base_model.config.use_cache = False
     if hasattr(base_model.config, "text_config"):
         base_model.config.text_config.use_cache = False
-
-    base_model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False, "context_fn": make_multigpu_rng_context_fn()}
-    )
+    base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False, "context_fn": make_multigpu_rng_context_fn()})
     base_model.enable_input_require_grads()
 
     if adapter_path is not None:
         console.print(f"[bold cyan]Loading existing trainable PEFT LoRA adapter:[/bold cyan] [green]{adapter_path}[/green]")
-        peft_model = PeftModel.from_pretrained(base_model, str(adapter_path), is_trainable=True)
+        peft_model = load_peft_adapter_preserving_sharding(base_model, adapter_path, is_trainable=True)
         lora_desc = f"pretrained={adapter_path}"
     else:
-        lora_config = LoraConfig(
-            r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, bias="none",
-            task_type="CAUSAL_LM", target_modules=LORA_TARGET_MODULES, exclude_modules=MULTIMODAL_EXCLUDE_REGEX,
-        )
+        lora_config = LoraConfig(r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, bias="none", task_type="CAUSAL_LM", target_modules=LORA_TARGET_MODULES, exclude_modules=MULTIMODAL_EXCLUDE_REGEX)
         peft_model = get_peft_model(base_model, lora_config)
         lora_desc = f"r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}, targets={LORA_TARGET_MODULES}"
 
@@ -380,18 +378,19 @@ def load_sharded_lora_model_and_tokenizer(
     tbl = Table(title=f"Sharded Model & LoRA Summary ({resolved_id})")
     tbl.add_column("Metric", style="cyan")
     tbl.add_column("Value", style="green")
-    tbl.add_row("Resolved Model ID", f"{resolved_id} ({model_type}, {quant_label})")
-    tbl.add_row("Attention Backend", f"{attn_arg} + 256-Token Chunked Vocab Cross-Entropy")
-    tbl.add_row("LoRA Config", lora_desc)
-    tbl.add_row("Parameters (Trainable / Frozen / Total)",
-                f"{param_stats['trainable_params']:,} / {param_stats['frozen_params']:,} / {param_stats['total_params']:,} ({param_stats['trainable_pct']}%)")
+    for k, v in (
+        ("Resolved Model ID", f"{resolved_id} ({model_type}, {quant_label})"),
+        ("Attention Backend", f"{attn_arg} + 256-Token Chunked Vocab Cross-Entropy"),
+        ("LoRA Config", lora_desc),
+        ("Parameters (Trainable / Frozen / Total)", f"{param_stats['trainable_params']:,} / {param_stats['frozen_params']:,} / {param_stats['total_params']:,} ({param_stats['trainable_pct']}%)"),
+    ):
+        tbl.add_row(k, v)
     for dev_key, dstat in vram_stats.items():
-        tbl.add_row(f"{dev_key} ({dstat['name']})",
-                    f"torch_alloc={dstat['allocated_mib']} MiB ({dstat['allocated_gib']} GiB) | driver_used={dstat['driver_used_mib']} / {dstat['total_mib']} MiB")
+        tbl.add_row(f"{dev_key} ({dstat['name']})", f"torch_alloc={dstat['allocated_mib']} MiB ({dstat['allocated_gib']} GiB) | driver_used={dstat['driver_used_mib']} / {dstat['total_mib']} MiB")
     console.print(tbl)
 
     return peft_model, tokenizer, {
-        "requested_model_id": model_id, "resolved_model_id": resolved_id, "model_type": model_type,
-        "is_moe": is_moe, "load_in_4bit": load_in_4bit, "attn_implementation": attn_arg,
+        "requested_model_id": model_id, "resolved_model_id": resolved_id, "model_type": model_type, "is_moe": is_moe,
+        "load_in_4bit": load_in_4bit, "attn_implementation": attn_arg,
         "device_map": getattr(base_model, "hf_device_map", topo["device_map"]), "param_stats": param_stats, "post_load_vram": vram_stats,
     }
