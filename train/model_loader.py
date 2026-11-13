@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import tempfile
 import types
 from collections.abc import Callable
 from typing import Any
@@ -31,7 +32,13 @@ from transformers import (
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from train.moe_quant import quantize_gemma4_moe_experts_in_place
+from train.moe_quant import finalize_disk_offloaded_moe_layers, quantize_gemma4_moe_experts_in_place
+
+GEMMA4_NON_EXPERT_SUBMODULES: tuple[str, ...] = (
+    "self_attn", "mlp", "input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm",
+    "post_feedforward_layernorm", "router", "post_feedforward_layernorm_1",
+    "post_feedforward_layernorm_2", "pre_feedforward_layernorm_2", "layer_scalar",
+)
 
 DEFAULT_MODEL_ID = "google/gemma-4-E4B-it"
 GEMMA2_GATED_ID = "google/gemma-2-9b-it"
@@ -66,7 +73,7 @@ def build_asymmetric_device_map(
     num_layers: int = GEMMA_NUM_LAYERS,
     primary_gpu_max_layer: int = PRIMARY_GPU_MAX_LAYER,
     offload_multimodal: bool = False,
-    offload_experts_to_cpu: bool = False,
+    offload_experts_to_disk: bool = False,
     include_audio: bool = True,
     include_per_layer: bool = True,
 ) -> dict[str, int | str]:
@@ -87,9 +94,15 @@ def build_asymmetric_device_map(
             device_map["model.language_model.per_layer_projection_norm"] = 1
         for layer_idx in range(num_layers):
             target_gpu = 1 if layer_idx <= primary_gpu_max_layer else 0
-            device_map[f"model.language_model.layers.{layer_idx}"] = target_gpu
-            if offload_experts_to_cpu:
-                device_map[f"model.language_model.layers.{layer_idx}.experts"] = "cpu"
+            if offload_experts_to_disk:
+                submods = GEMMA4_NON_EXPERT_SUBMODULES + (
+                    ("per_layer_input_gate", "per_layer_projection", "post_per_layer_input_norm") if include_per_layer else ()
+                )
+                for sub in submods:
+                    device_map[f"model.language_model.layers.{layer_idx}.{sub}"] = target_gpu
+                device_map[f"model.language_model.layers.{layer_idx}.experts"] = "disk"
+            else:
+                device_map[f"model.language_model.layers.{layer_idx}"] = target_gpu
         device_map["model.language_model.norm"] = 0
         device_map["model.language_model.rotary_emb"] = 0
         device_map["lm_head"] = 0
@@ -128,26 +141,19 @@ def install_chunked_causal_lm_loss(base_model: PreTrainedModel, chunk_size: int 
             return orig_forward(input_ids=input_ids, attention_mask=attention_mask, labels=None, **kwargs)
 
         backbone_kwargs = {k: v for k, v in kwargs.items() if k not in ("logits_to_keep", "return_dict")}
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True,
-            **backbone_kwargs,
-        )
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True, **backbone_kwargs)
         hidden_states: torch.Tensor = outputs.last_hidden_state
         shift_h = hidden_states[:, :-1, :].contiguous().view(-1, hidden_states.size(-1))
         shift_y = labels[:, 1:].to(shift_h.device).contiguous().view(-1)
         valid_mask = shift_y != -100
-        active_h = shift_h[valid_mask]
-        active_y = shift_y[valid_mask]
+        active_h, active_y = shift_h[valid_mask], shift_y[valid_mask]
 
         if active_y.numel() == 0:
             loss = (hidden_states[:, :1, :].sum() * 0.0).float()
         else:
             total_nll = torch.zeros((), device=active_h.device, dtype=torch.float32)
             for start in range(0, active_h.size(0), chunk_size):
-                h_slice = active_h[start : start + chunk_size]
-                y_slice = active_y[start : start + chunk_size]
+                h_slice, y_slice = active_h[start : start + chunk_size], active_y[start : start + chunk_size]
                 if torch.is_grad_enabled() and h_slice.requires_grad:
                     chunk_loss = torch.utils.checkpoint.checkpoint(
                         _chunk_nll, self.lm_head, h_slice, y_slice, use_reentrant=False
@@ -160,10 +166,8 @@ def install_chunked_causal_lm_loss(base_model: PreTrainedModel, chunk_size: int 
             loss = total_nll / max(denom, 1.0)
 
         # Return a lightweight CausalLM output without keeping a 1.72 GiB [B, S, 262144] logits tensor alive
-        dummy_logits = hidden_states[:, :1, :1]
         return CausalLMOutputWithPast(
-            loss=loss,
-            logits=dummy_logits,
+            loss=loss, logits=hidden_states[:, :1, :1],
             past_key_values=getattr(outputs, "past_key_values", None),
             hidden_states=getattr(outputs, "hidden_states", None),
             attentions=getattr(outputs, "attentions", None),
@@ -210,18 +214,14 @@ def query_dual_gpu_vram() -> dict[str, dict[str, float | str]]:
     if not torch.cuda.is_available():
         return stats
     for idx in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(idx)
         alloc_mib = torch.cuda.memory_allocated(idx) / (1024**2)
-        res_mib = torch.cuda.memory_reserved(idx) / (1024**2)
-        peak_mib = torch.cuda.max_memory_allocated(idx) / (1024**2)
         free_b, total_b = torch.cuda.mem_get_info(idx)
-        used_driver_mib = (total_b - free_b) / (1024**2)
-        total_mib = total_b / (1024**2)
+        used_driver_mib, total_mib = (total_b - free_b) / (1024**2), total_b / (1024**2)
         stats[f"cuda:{idx}"] = {
-            "name": props.name,
+            "name": torch.cuda.get_device_properties(idx).name,
             "allocated_mib": round(alloc_mib, 1),
-            "reserved_mib": round(res_mib, 1),
-            "peak_allocated_mib": round(peak_mib, 1),
+            "reserved_mib": round(torch.cuda.memory_reserved(idx) / (1024**2), 1),
+            "peak_allocated_mib": round(torch.cuda.max_memory_allocated(idx) / (1024**2), 1),
             "driver_used_mib": round(used_driver_mib, 1),
             "total_mib": round(total_mib, 1),
             "allocated_gib": round(alloc_mib / 1024.0, 2),
@@ -235,14 +235,8 @@ def count_model_parameters(model: nn.Module) -> dict[str, int | float]:
     """Compute trainable, frozen, and total parameter counts."""
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    frozen = total - trainable
     pct = (100.0 * trainable / total) if total > 0 else 0.0
-    return {
-        "trainable_params": trainable,
-        "frozen_params": frozen,
-        "total_params": total,
-        "trainable_pct": round(pct, 4),
-    }
+    return {"trainable_params": trainable, "frozen_params": total - trainable, "total_params": total, "trainable_pct": round(pct, 4)}
 
 
 def get_input_device(model: nn.Module) -> torch.device:
@@ -281,7 +275,7 @@ def resolve_model_topology(
     split_layer = 21 if num_layers <= 30 else PRIMARY_GPU_MAX_LAYER
     device_map = build_asymmetric_device_map(
         model_type=model_type, num_layers=num_layers, primary_gpu_max_layer=split_layer,
-        offload_multimodal=bool(load_in_4bit or is_moe), offload_experts_to_cpu=bool(load_in_4bit and is_moe),
+        offload_multimodal=bool(load_in_4bit or is_moe), offload_experts_to_disk=bool(load_in_4bit and is_moe),
         include_audio=has_audio, include_per_layer=has_ple,
     )
     if model_type == "gemma4" and attn_implementation == "sdpa":
@@ -294,6 +288,40 @@ def resolve_model_topology(
         "resolved_id": resolved_id, "model_type": model_type, "num_layers": num_layers,
         "is_moe": is_moe, "split_layer": split_layer, "device_map": device_map, "attn_arg": attn_arg,
     }
+
+
+def load_sharded_base_model(
+    topo: dict[str, Any],
+    tokenizer_source: str | os.PathLike[str] | None = None,
+    load_in_4bit: bool = False,
+    console: Console | None = None,
+) -> tuple[PreTrainedModel, PreTrainedTokenizerBase]:
+    """Load base checkpoint across dual GPUs, streaming disk-offloaded MoE experts into 4-bit NF4 without swap."""
+    resolved_id, num_layers = topo["resolved_id"], topo["num_layers"]
+    is_moe, split_layer, device_map, attn_arg = topo["is_moe"], topo["split_layer"], topo["device_map"], topo["attn_arg"]
+    tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_source) if tokenizer_source else resolved_id)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    load_kwargs: dict[str, Any] = {"dtype": torch.bfloat16, "device_map": device_map, "attn_implementation": attn_arg}
+    if load_in_4bit:
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16, llm_int8_enable_fp32_cpu_offload=True,
+        )
+    needs_offload = isinstance(device_map, dict) and "disk" in device_map.values()
+    with (tempfile.TemporaryDirectory(prefix="gemma_offload_") if needs_offload else contextlib.nullcontext()) as offload_dir:
+        if offload_dir:
+            load_kwargs["offload_folder"] = offload_dir
+        base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(resolved_id, **load_kwargs)
+        if load_in_4bit and is_moe:
+            layer_devs = {i: (1 if i <= split_layer else 0) for i in range(num_layers)}
+            replaced = quantize_gemma4_moe_experts_in_place(base_model, layer_device_map=layer_devs)
+            if needs_offload:
+                finalize_disk_offloaded_moe_layers(base_model, layer_device_map=layer_devs)
+            if console is not None:
+                console.print(f"[cyan]Quantized {replaced} Gemma 4 MoE expert layers to 4-bit NF4 on target GPUs.[/cyan]")
+    install_chunked_causal_lm_loss(base_model, chunk_size=256)
+    return base_model, tokenizer
 
 
 def load_sharded_lora_model_and_tokenizer(
@@ -310,29 +338,15 @@ def load_sharded_lora_model_and_tokenizer(
     console = console or Console()
     topo = resolve_model_topology(model_id=model_id, attn_implementation=attn_implementation, load_in_4bit=load_in_4bit)
     resolved_id, model_type, num_layers = topo["resolved_id"], topo["model_type"], topo["num_layers"]
-    is_moe, split_layer, device_map, attn_arg = topo["is_moe"], topo["split_layer"], topo["device_map"], topo["attn_arg"]
+    is_moe, attn_arg = topo["is_moe"], topo["attn_arg"]
     quant_label = "4-bit NF4 QLoRA" if load_in_4bit else "bfloat16"
     console.print(
         f"[bold cyan]Loading base model:[/bold cyan] [green]{resolved_id}[/green] "
         f"(model_type={model_type}, layers={num_layers}, moe={is_moe}, precision={quant_label}, attn={attn_arg})"
     )
-
-    tokenizer = AutoTokenizer.from_pretrained(str(adapter_path) if adapter_path else resolved_id)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    load_kwargs: dict[str, Any] = {"dtype": torch.bfloat16, "device_map": device_map, "attn_implementation": attn_arg}
-    if load_in_4bit:
-        load_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16, llm_int8_enable_fp32_cpu_offload=True,
-        )
-
-    base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(resolved_id, **load_kwargs)
-    if load_in_4bit and is_moe:
-        layer_devs = {i: (1 if i <= split_layer else 0) for i in range(num_layers)}
-        replaced = quantize_gemma4_moe_experts_in_place(base_model, layer_device_map=layer_devs)
-        console.print(f"[cyan]Quantized {replaced} Gemma 4 MoE expert layers to 4-bit NF4 on target GPUs.[/cyan]")
+    base_model, tokenizer = load_sharded_base_model(
+        topo, tokenizer_source=adapter_path, load_in_4bit=load_in_4bit, console=console
+    )
 
     for param in base_model.parameters():
         param.requires_grad_(False)
@@ -341,7 +355,6 @@ def load_sharded_lora_model_and_tokenizer(
     if hasattr(base_model.config, "text_config"):
         base_model.config.text_config.use_cache = False
 
-    install_chunked_causal_lm_loss(base_model, chunk_size=256)
     base_model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False, "context_fn": make_multigpu_rng_context_fn()}
     )
@@ -363,31 +376,22 @@ def load_sharded_lora_model_and_tokenizer(
         if param.requires_grad and param.dtype != torch.bfloat16:
             param.data = param.data.to(dtype=torch.bfloat16)
 
-    param_stats = count_model_parameters(peft_model)
-    vram_stats = query_dual_gpu_vram()
-
+    param_stats, vram_stats = count_model_parameters(peft_model), query_dual_gpu_vram()
     tbl = Table(title=f"Sharded Model & LoRA Summary ({resolved_id})")
     tbl.add_column("Metric", style="cyan")
     tbl.add_column("Value", style="green")
     tbl.add_row("Resolved Model ID", f"{resolved_id} ({model_type}, {quant_label})")
     tbl.add_row("Attention Backend", f"{attn_arg} + 256-Token Chunked Vocab Cross-Entropy")
     tbl.add_row("LoRA Config", lora_desc)
-    tbl.add_row(
-        "Parameters (Trainable / Frozen / Total)",
-        f"{param_stats['trainable_params']:,} / {param_stats['frozen_params']:,} / "
-        f"{param_stats['total_params']:,} ({param_stats['trainable_pct']}%)",
-    )
+    tbl.add_row("Parameters (Trainable / Frozen / Total)",
+                f"{param_stats['trainable_params']:,} / {param_stats['frozen_params']:,} / {param_stats['total_params']:,} ({param_stats['trainable_pct']}%)")
     for dev_key, dstat in vram_stats.items():
-        tbl.add_row(
-            f"{dev_key} ({dstat['name']})",
-            f"torch_alloc={dstat['allocated_mib']} MiB ({dstat['allocated_gib']} GiB) | "
-            f"driver_used={dstat['driver_used_mib']} / {dstat['total_mib']} MiB",
-        )
+        tbl.add_row(f"{dev_key} ({dstat['name']})",
+                    f"torch_alloc={dstat['allocated_mib']} MiB ({dstat['allocated_gib']} GiB) | driver_used={dstat['driver_used_mib']} / {dstat['total_mib']} MiB")
     console.print(tbl)
 
-    load_meta = {
+    return peft_model, tokenizer, {
         "requested_model_id": model_id, "resolved_model_id": resolved_id, "model_type": model_type,
         "is_moe": is_moe, "load_in_4bit": load_in_4bit, "attn_implementation": attn_arg,
-        "device_map": device_map, "param_stats": param_stats, "post_load_vram": vram_stats,
+        "device_map": getattr(base_model, "hf_device_map", topo["device_map"]), "param_stats": param_stats, "post_load_vram": vram_stats,
     }
-    return peft_model, tokenizer, load_meta

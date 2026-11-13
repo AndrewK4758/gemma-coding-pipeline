@@ -32,7 +32,7 @@ import torch
 from peft import PeftModel
 from rich.console import Console
 from rich.table import Table
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -45,11 +45,10 @@ from train.dpo_compiler import _encode_padded_tensors, compute_chunked_sequence_
 from train.model_loader import (
     DEFAULT_MODEL_ID,
     get_input_device,
-    install_chunked_causal_lm_loss,
+    load_sharded_base_model,
     query_dual_gpu_vram,
     resolve_model_topology,
 )
-from train.moe_quant import quantize_gemma4_moe_experts_in_place
 
 # Held-out coding prompts live in eval/held_out_prompts.py (5 TS, 5 Go, 5 C#, 5 C/C++).
 
@@ -71,26 +70,10 @@ def load_multi_adapter_benchmark_model(
     """Load base model once across cuda:1 + cuda:0 and attach both 'sft' and 'dpo' LoRA adapters."""
     t0 = time.time()
     topo = resolve_model_topology(model_id=model_id, attn_implementation="sdpa", load_in_4bit=load_in_4bit)
-    resolved_id = topo["resolved_id"]
-    model_type = topo["model_type"]
-    num_layers = topo["num_layers"]
-    is_moe = topo["is_moe"]
-    split_layer = topo["split_layer"]
-    device_map = topo["device_map"]
-    attn_arg = topo["attn_arg"]
-    tokenizer = AutoTokenizer.from_pretrained(str(dpo_adapter_dir))
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    load_kw: dict[str, Any] = {"dtype": torch.bfloat16, "device_map": device_map, "attn_implementation": attn_arg}
-    if load_in_4bit:
-        load_kw["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16, llm_int8_enable_fp32_cpu_offload=True,
-        )
-    base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(resolved_id, **load_kw)
-    if load_in_4bit and is_moe:
-        quantize_gemma4_moe_experts_in_place(base_model, layer_device_map={i: (1 if i <= split_layer else 0) for i in range(num_layers)})
-    install_chunked_causal_lm_loss(base_model, chunk_size=256)
+    resolved_id, model_type = topo["resolved_id"], topo["model_type"]
+    base_model, tokenizer = load_sharded_base_model(
+        topo, tokenizer_source=dpo_adapter_dir, load_in_4bit=load_in_4bit, console=console
+    )
 
     peft_model = PeftModel.from_pretrained(base_model, str(sft_adapter_dir), adapter_name="sft", is_trainable=False)
     peft_model.load_adapter(str(dpo_adapter_dir), adapter_name="dpo", is_trainable=False)

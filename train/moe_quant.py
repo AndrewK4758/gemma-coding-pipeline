@@ -212,3 +212,29 @@ def quantize_gemma4_moe_experts_in_place(
             gc.collect()
             torch.cuda.empty_cache()
     return replaced
+
+
+def finalize_disk_offloaded_moe_layers(
+    model: nn.Module,
+    layer_device_map: dict[int, int | str],
+    prefix: str = "model.language_model.layers",
+) -> None:
+    """Install entry device hooks on decoder layers and compact `hf_device_map` after disk-expert replacement."""
+    from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+
+    lang_model = getattr(getattr(model, "model", model), "language_model", getattr(model, "model", model))
+    layers = getattr(lang_model, "layers", [])
+    hmap = getattr(model, "hf_device_map", None)
+    for idx in range(len(layers)):
+        target_dev = layer_device_map.get(idx)
+        if target_dev is None:
+            continue
+        if isinstance(target_dev, int) and not torch.cuda.is_available():
+            target_dev = "cpu"
+        if not hasattr(layers[idx], "_hf_hook"):
+            add_hook_to_module(layers[idx], AlignDevicesHook(execution_device=target_dev, place_submodules=False))
+        if isinstance(hmap, dict):
+            layer_prefix = f"{prefix}.{idx}"
+            for key in [k for k in hmap if k.startswith(f"{layer_prefix}.")]:
+                del hmap[key]
+            hmap[layer_prefix] = target_dev

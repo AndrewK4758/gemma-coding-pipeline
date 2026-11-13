@@ -66,7 +66,10 @@ class TestModelLoadingAndExport(unittest.TestCase):
         self.assertTrue(topo["is_moe"])
         self.assertNotIn("model.audio_tower", topo["device_map"])
         self.assertNotIn("model.language_model.embed_tokens_per_layer", topo["device_map"])
-        self.assertEqual(topo["device_map"]["model.language_model.layers.0.experts"], "cpu")
+        self.assertNotIn("model.language_model.layers.0", topo["device_map"])
+        self.assertEqual(topo["device_map"]["model.language_model.layers.0.self_attn"], 1)
+        self.assertEqual(topo["device_map"]["model.language_model.layers.22.self_attn"], 0)
+        self.assertEqual(topo["device_map"]["model.language_model.layers.0.experts"], "disk")
 
     def test_quantize_moe_experts_reads_meta_offloaded_weights_map(self) -> None:
         from accelerate.hooks import AlignDevicesHook, add_hook_to_module
@@ -171,6 +174,72 @@ class TestModelLoadingAndExport(unittest.TestCase):
                 self.assertEqual(int(fake_states[1].item()), 20)
             self.assertEqual(int(fake_states[0].item()), 99)
             self.assertEqual(int(fake_states[1].item()), 88)
+
+    def test_disk_offload_moe_finalize_hooks_and_clean_hf_device_map(self) -> None:
+        from transformers import AutoModelForCausalLM, Gemma4ForCausalLM, Gemma4TextConfig
+        from train.moe_quant import (
+            _extract_expert_tensor,
+            _release_offload_hooks,
+            finalize_disk_offloaded_moe_layers,
+        )
+
+        cfg = Gemma4TextConfig(
+            hidden_size=64, intermediate_size=128, moe_intermediate_size=64, num_hidden_layers=2,
+            num_attention_heads=2, num_key_value_heads=1, head_dim=32, global_head_dim=32,
+            vocab_size=128, enable_moe_block=True, num_experts=4, top_k_experts=2,
+            hidden_size_per_layer_input=0, num_kv_shared_layers=0, layer_types=["sliding_attention", "full_attention"],
+        )
+        m0 = Gemma4ForCausalLM(cfg).to(dtype=torch.bfloat16)
+        with tempfile.TemporaryDirectory() as ckpt, tempfile.TemporaryDirectory() as off:
+            m0.save_pretrained(ckpt, safe_serialization=True)
+            dmap = {"model.embed_tokens": "cpu", "model.norm": "cpu", "model.rotary_emb": "cpu", "lm_head": "cpu"}
+            for i in range(2):
+                dmap[f"model.layers.{i}.layer_scalar"] = "cpu"
+                for name, _ in m0.model.layers[i].named_children():
+                    dmap[f"model.layers.{i}.{name}"] = "disk" if name == "experts" else "cpu"
+            loaded = AutoModelForCausalLM.from_pretrained(ckpt, dtype=torch.bfloat16, device_map=dmap, offload_folder=off)
+            self.assertEqual(list(Path(off).iterdir()), [])
+            for i in range(2):
+                gu = _extract_expert_tensor(loaded.model.layers[i].experts, "gate_up_proj")
+                self.assertEqual(gu.shape, (4, 128, 64))
+                _release_offload_hooks(loaded.model.layers[i].experts)
+            finalize_disk_offloaded_moe_layers(loaded, layer_device_map={0: "cpu", 1: "cpu"}, prefix="model.layers")
+            self.assertEqual(loaded.hf_device_map["model.layers.0"], "cpu")
+            self.assertNotIn("model.layers.0.layer_scalar", loaded.hf_device_map)
+            self.assertTrue(hasattr(loaded.model.layers[0], "_hf_hook"))
+
+    def test_resolve_base_snapshot_dir_handles_partial_main_revision(self) -> None:
+        from export.merge_and_quantize_gguf import resolve_base_snapshot_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            snaps = Path(tmp) / "snapshots"
+            partial = snaps / "rev_partial"
+            complete = snaps / "rev_complete"
+            partial.mkdir(parents=True)
+            complete.mkdir(parents=True)
+            (partial / "config.json").write_text("{}")
+            (complete / "config.json").write_text("{}")
+            (complete / "model.safetensors").write_text("weights")
+
+            def _fake_cached(repo_id: str, filename: str, local_files_only: bool = False) -> str:
+                if filename == "config.json":
+                    return str(partial / "config.json")
+                raise FileNotFoundError(filename)
+
+            with (
+                mock.patch("export.merge_and_quantize_gguf.cached_file", side_effect=_fake_cached),
+                mock.patch("export.merge_and_quantize_gguf.snapshot_download", side_effect=AssertionError("unexpected call")),
+            ):
+                resolved = resolve_base_snapshot_dir("google/gemma-4-E4B-it")
+            self.assertEqual(resolved, complete)
+
+            index_file = complete / "model.safetensors.index.json"
+            index_file.write_text("{}")
+            with (
+                mock.patch("export.merge_and_quantize_gguf.cached_file", return_value=str(index_file)),
+                mock.patch("export.merge_and_quantize_gguf.snapshot_download", side_effect=AssertionError("unexpected call")),
+            ):
+                self.assertEqual(resolve_base_snapshot_dir("google/gemma-4-26B-A4B-it"), complete)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ import pyarrow.parquet as pq
 from huggingface_hub import snapshot_download
 from rich.console import Console
 from rich.table import Table
+from transformers.utils import cached_file
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -73,12 +74,35 @@ def _ensure_train_gpu_mode(console: Console) -> None:
         time.sleep(2)
 
 
+def resolve_base_snapshot_dir(resolved_id: str) -> Path:
+    """Resolve local HF snapshot directory containing base weight shards without failing on missing docs/eval files."""
+    direct = Path(resolved_id)
+    if direct.is_dir():
+        return direct
+    for marker in ("model.safetensors.index.json", "model.safetensors"):
+        try:
+            return Path(cached_file(resolved_id, marker, local_files_only=True)).parent
+        except Exception:
+            pass
+    try:
+        snaps_dir = Path(cached_file(resolved_id, "config.json", local_files_only=True)).parent.parent
+        candidates = sorted((d for d in snaps_dir.iterdir() if d.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True)
+        for snap in candidates:
+            if (snap / "config.json").exists() and (
+                (snap / "model.safetensors.index.json").exists() or (snap / "model.safetensors").exists()
+            ):
+                return snap
+    except Exception:
+        pass
+    return Path(snapshot_download(repo_id=resolved_id, local_files_only=True, ignore_patterns=[".eval_results/*", "*.md", ".git*"]))
+
+
 def merge_lora_to_bf16(
     model_id: str, adapter_dir: Path, merged_dir: Path, console: Console, force: bool = False
 ) -> tuple[dict[str, Any], Path]:
     """Stream base shards on CPU and fold LoRA weights into merged bfloat16 safetensors."""
     resolved_id = resolve_checkpoint_id(model_id)
-    base_snapshot = Path(snapshot_download(repo_id=resolved_id, local_files_only=True))
+    base_snapshot = resolve_base_snapshot_dir(resolved_id)
     existing_shards = list(merged_dir.glob("*.safetensors")) if merged_dir.exists() else []
     total_existing = sum(p.stat().st_size for p in existing_shards)
     adapter_weights = adapter_dir / "adapter_model.safetensors"
