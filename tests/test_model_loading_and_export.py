@@ -378,6 +378,25 @@ class TestModelLoadingAndExport(unittest.TestCase):
         plan = dict(build_stage_commands(parse_args(["--tier", "smoke", "--stages", "grpo"])))
         self.assertIn("--max-seq-length", plan["grpo"])
 
+    def test_pipeline_tier_eval_steps_scaling(self) -> None:
+        from run_pipeline import build_stage_commands, parse_args
+
+        def _flag(cmd: list[str], name: str) -> str:
+            return cmd[cmd.index(name) + 1]
+
+        for tier, exp_sft, exp_dpo in (("smoke", "5", "5"), ("dev", "50", "30"), ("full", "250", "150")):
+            plan = dict(build_stage_commands(parse_args(["--tier", tier, "--stages", "sft,dpo"])))
+            self.assertEqual(_flag(plan["sft"], "--eval-steps"), exp_sft)
+            self.assertEqual(_flag(plan["dpo"], "--eval-steps"), exp_dpo)
+
+        scaled = dict(build_stage_commands(parse_args(["--tier", "full", "--stages", "sft,dpo", "--sft-steps", "40", "--dpo-steps", "20"])))
+        self.assertEqual(_flag(scaled["sft"], "--eval-steps"), "10")
+        self.assertEqual(_flag(scaled["dpo"], "--eval-steps"), "5")
+
+        explicit = dict(build_stage_commands(parse_args(["--tier", "full", "--stages", "sft,dpo", "--sft-eval-steps", "100", "--dpo-eval-steps", "75"])))
+        self.assertEqual(_flag(explicit["sft"], "--eval-steps"), "100")
+        self.assertEqual(_flag(explicit["dpo"], "--eval-steps"), "75")
+
 
 if __name__ == "__main__":
     unittest.main()
