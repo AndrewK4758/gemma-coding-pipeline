@@ -32,7 +32,7 @@ import torch
 from peft import PeftModel
 from rich.console import Console
 from rich.table import Table
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel, PreTrainedTokenizerBase
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -44,10 +44,10 @@ from eval.held_out_prompts import HELD_OUT_CODING_SUITE
 from train.dpo_compiler import _encode_padded_tensors, compute_chunked_sequence_logps, load_dpo_split
 from train.model_loader import (
     DEFAULT_MODEL_ID,
-    build_asymmetric_device_map,
+    get_input_device,
     install_chunked_causal_lm_loss,
     query_dual_gpu_vram,
-    resolve_checkpoint_id,
+    resolve_model_topology,
 )
 from train.moe_quant import quantize_gemma4_moe_experts_in_place
 
@@ -70,18 +70,14 @@ def load_multi_adapter_benchmark_model(
 ) -> tuple[PeftModel, PreTrainedTokenizerBase, dict[str, Any]]:
     """Load base model once across cuda:1 + cuda:0 and attach both 'sft' and 'dpo' LoRA adapters."""
     t0 = time.time()
-    resolved_id = resolve_checkpoint_id(model_id)
-    cfg = AutoConfig.from_pretrained(resolved_id)
-    model_type = getattr(cfg, "model_type", "gemma4")
-    text_cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
-    num_layers = getattr(text_cfg, "num_hidden_layers", 42)
-    is_moe = bool(getattr(text_cfg, "enable_moe_block", False) or getattr(text_cfg, "num_experts", 0) > 1)
-    split_layer = 21 if num_layers <= 30 else 26
-    device_map = build_asymmetric_device_map(
-        model_type=model_type, num_layers=num_layers, primary_gpu_max_layer=split_layer,
-        offload_multimodal=bool(load_in_4bit or is_moe), offload_experts_to_cpu=bool(load_in_4bit and is_moe),
-    )
-    attn_arg = {"text_config": "sdpa", "vision_config": "sdpa", "audio_config": "eager"} if model_type == "gemma4" else "sdpa"
+    topo = resolve_model_topology(model_id=model_id, attn_implementation="sdpa", load_in_4bit=load_in_4bit)
+    resolved_id = topo["resolved_id"]
+    model_type = topo["model_type"]
+    num_layers = topo["num_layers"]
+    is_moe = topo["is_moe"]
+    split_layer = topo["split_layer"]
+    device_map = topo["device_map"]
+    attn_arg = topo["attn_arg"]
     tokenizer = AutoTokenizer.from_pretrained(str(dpo_adapter_dir))
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -199,7 +195,7 @@ def evaluate_live_compile_pass_at_1(
     causal_lm = model.get_base_model() if hasattr(model, "get_base_model") else model
     sot = str(tokenizer.special_tokens_map.get("sot_token", "<start_of_turn>"))
     eot = str(tokenizer.special_tokens_map.get("eot_token", "<end_of_turn>"))
-    first_dev = next(causal_lm.model.parameters()).device
+    first_dev = get_input_device(causal_lm)
 
     orig_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"

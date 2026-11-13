@@ -47,6 +47,7 @@ from data.ingest_sources import extract_fenced_code
 from train.dpo_compiler import _encode_padded_tensors, compute_chunked_sequence_logps
 from train.model_loader import (
     DEFAULT_MODEL_ID,
+    get_input_device,
     load_sharded_lora_model_and_tokenizer,
     query_dual_gpu_vram,
 )
@@ -118,7 +119,7 @@ def generate_group_completions(
     eot = str(tokenizer.special_tokens_map.get("eot_token", "<end_of_turn>"))
     chat_prompt = f"{sot}user\n{SYSTEM_PREAMBLE}\n\n{prompt_text.strip()}{eot}\n{sot}model\n"
 
-    first_dev = next(causal_lm.model.parameters()).device
+    first_dev = get_input_device(causal_lm)
     enc = tokenizer(chat_prompt, return_tensors="pt", add_special_tokens=True)
     prompt_ids = enc["input_ids"].repeat(num_generations, 1).to(first_dev)
     prompt_mask = enc["attention_mask"].repeat(num_generations, 1).to(first_dev)

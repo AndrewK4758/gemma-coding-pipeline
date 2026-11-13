@@ -45,6 +45,7 @@ if str(REPO_ROOT) not in sys.path:
 from data.build_dataset import format_gemma2_chat_and_mask_labels, format_gemma_messages_and_mask_labels
 from train.model_loader import (
     DEFAULT_MODEL_ID,
+    get_input_device,
     load_sharded_lora_model_and_tokenizer,
     query_dual_gpu_vram,
 )
@@ -96,7 +97,7 @@ def compute_chunked_sequence_logps(
             logits_chunk = torch.tanh(logits_chunk / softcap) * softcap
         return -F.cross_entropy(logits_chunk.float(), y_chunk, reduction="sum")
 
-    first_dev = next(causal_lm.model.parameters()).device
+    first_dev = get_input_device(causal_lm)
     outputs = causal_lm.model(
         input_ids=input_ids.to(first_dev),
         attention_mask=attention_mask.to(first_dev),

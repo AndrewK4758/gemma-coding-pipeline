@@ -104,9 +104,11 @@ def merge_lora_weights_into_shards(base_snapshot: Path, adapter_dir: Path, merge
     t0 = time.time()
     base_snapshot, adapter_dir, merged_dir = Path(base_snapshot), Path(adapter_dir), Path(merged_dir)
     merged_dir.mkdir(parents=True, exist_ok=True)
-    for existing in merged_dir.iterdir():
+    for existing in list(merged_dir.iterdir()):
         if existing.is_file():
             existing.chmod(0o644)
+            if existing.suffix == ".safetensors" or existing.name == "model.safetensors.index.json":
+                existing.unlink()
 
     deltas, _ = _load_lora_deltas(adapter_dir)
     _copy_non_weight_assets(base_snapshot, adapter_dir, merged_dir)

@@ -220,26 +220,38 @@ def count_model_parameters(model: nn.Module) -> dict[str, int | float]:
     }
 
 
-def load_sharded_lora_model_and_tokenizer(
+def get_input_device(model: nn.Module) -> torch.device:
+    """Return the token-embedding device for input_ids, skipping CPU-offloaded vision/audio towers."""
+    get_emb = getattr(model, "get_input_embeddings", None)
+    if callable(get_emb):
+        emb = get_emb()
+        if emb is not None:
+            weight = getattr(emb, "weight", None)
+            if weight is not None and getattr(weight, "device", None) is not None and weight.device.type != "meta":
+                return weight.device
+            for p in emb.parameters():
+                if p.device.type != "meta":
+                    return p.device
+    for p in model.parameters():
+        if p.device.type not in ("cpu", "meta"):
+            return p.device
+    return next(model.parameters()).device
+
+
+def resolve_model_topology(
     model_id: str = DEFAULT_MODEL_ID,
-    lora_r: int = 32,
-    lora_alpha: int = 64,
-    lora_dropout: float = 0.05,
     attn_implementation: str = "sdpa",
-    adapter_path: str | os.PathLike[str] | None = None,
     load_in_4bit: bool = False,
-    console: Console | None = None,
-) -> tuple[PeftModel, PreTrainedTokenizerBase, dict[str, Any]]:
-    """Load base Gemma checkpoint (bfloat16 or QLoRA 4-bit NF4) across cuda:1 + cuda:0 with PEFT LoRA."""
-    console = console or Console()
+) -> dict[str, Any]:
+    """Inspect HuggingFace config and compute asymmetric dual-GPU device_map and MoE flags."""
     resolved_id = resolve_checkpoint_id(model_id)
     cfg = AutoConfig.from_pretrained(resolved_id)
     model_type = getattr(cfg, "model_type", "gemma4")
     text_cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
-    num_layers = getattr(text_cfg, "num_hidden_layers", GEMMA_NUM_LAYERS)
-    is_moe = bool(getattr(text_cfg, "enable_moe_block", False) or getattr(text_cfg, "num_experts", 0) > 1)
+    num_layers = int(getattr(text_cfg, "num_hidden_layers", GEMMA_NUM_LAYERS) or GEMMA_NUM_LAYERS)
+    num_experts = getattr(text_cfg, "num_experts", 0) or 0
+    is_moe = bool(getattr(text_cfg, "enable_moe_block", False) or num_experts > 1)
     split_layer = 21 if num_layers <= 30 else PRIMARY_GPU_MAX_LAYER
-
     device_map = build_asymmetric_device_map(
         model_type=model_type,
         num_layers=num_layers,
@@ -252,6 +264,41 @@ def load_sharded_lora_model_and_tokenizer(
         if model_type == "gemma4" and attn_implementation == "sdpa"
         else attn_implementation
     )
+    return {
+        "resolved_id": resolved_id,
+        "model_type": model_type,
+        "num_layers": num_layers,
+        "is_moe": is_moe,
+        "split_layer": split_layer,
+        "device_map": device_map,
+        "attn_arg": attn_arg,
+    }
+
+
+def load_sharded_lora_model_and_tokenizer(
+    model_id: str = DEFAULT_MODEL_ID,
+    lora_r: int = 32,
+    lora_alpha: int = 64,
+    lora_dropout: float = 0.05,
+    attn_implementation: str = "sdpa",
+    adapter_path: str | os.PathLike[str] | None = None,
+    load_in_4bit: bool = False,
+    console: Console | None = None,
+) -> tuple[PeftModel, PreTrainedTokenizerBase, dict[str, Any]]:
+    """Load base Gemma checkpoint (bfloat16 or QLoRA 4-bit NF4) across cuda:1 + cuda:0 with PEFT LoRA."""
+    console = console or Console()
+    topo = resolve_model_topology(
+        model_id=model_id,
+        attn_implementation=attn_implementation,
+        load_in_4bit=load_in_4bit,
+    )
+    resolved_id = topo["resolved_id"]
+    model_type = topo["model_type"]
+    num_layers = topo["num_layers"]
+    is_moe = topo["is_moe"]
+    split_layer = topo["split_layer"]
+    device_map = topo["device_map"]
+    attn_arg = topo["attn_arg"]
     quant_label = "4-bit NF4 QLoRA" if load_in_4bit else "bfloat16"
     console.print(
         f"[bold cyan]Loading base model:[/bold cyan] [green]{resolved_id}[/green] "
