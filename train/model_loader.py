@@ -8,8 +8,10 @@ Supports both:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import types
+from collections.abc import Callable
 from typing import Any
 
 # Ensure lazy CUDA module loading and dual-GPU visibility before importing torch/bitsandbytes
@@ -25,12 +27,7 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from rich.console import Console
 from rich.table import Table
 from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    PreTrainedModel,
-    PreTrainedTokenizerBase,
+    AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel, PreTrainedTokenizerBase,
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -43,15 +40,7 @@ GEMMA2_MIRROR_ID = "unsloth/gemma-2-9b-it"
 GEMMA_NUM_LAYERS = 42
 PRIMARY_GPU_MAX_LAYER = 26  # Layers 0..26 (27 layers) on cuda:1 (16 GB); Layers 27..41 (15 layers) on cuda:0
 
-LORA_TARGET_MODULES: list[str] = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-]
+LORA_TARGET_MODULES: list[str] = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 MULTIMODAL_EXCLUDE_REGEX = r".*(vision_tower|audio_tower|embed_vision|embed_audio).*"
 
 
@@ -183,6 +172,38 @@ def install_chunked_causal_lm_loss(base_model: PreTrainedModel, chunk_size: int 
     base_model.forward = types.MethodType(_chunked_forward, base_model)
 
 
+def make_multigpu_rng_context_fn() -> Callable[[], tuple[Any, Any]]:
+    """Snapshot and restore CUDA RNG across ALL visible GPUs for cross-device gradient checkpointing."""
+
+    def _context_fn() -> tuple[Any, Any]:
+        saved_states: dict[int, torch.Tensor] = {}
+        if torch.cuda.is_available():
+            for dev_idx in range(torch.cuda.device_count()):
+                saved_states[dev_idx] = torch.cuda.get_rng_state(dev_idx)
+
+        @contextlib.contextmanager
+        def _forward_ctx():
+            yield
+
+        @contextlib.contextmanager
+        def _recompute_ctx():
+            if not saved_states:
+                yield
+                return
+            prev_states = {dev_idx: torch.cuda.get_rng_state(dev_idx) for dev_idx in saved_states}
+            for dev_idx, st in saved_states.items():
+                torch.cuda.set_rng_state(st, dev_idx)
+            try:
+                yield
+            finally:
+                for dev_idx, st in prev_states.items():
+                    torch.cuda.set_rng_state(st, dev_idx)
+
+        return _forward_ctx(), _recompute_ctx()
+
+    return _context_fn
+
+
 def query_dual_gpu_vram() -> dict[str, dict[str, float | str]]:
     """Return current allocated, reserved, and total VRAM (in MiB and GiB) for cuda:0 and cuda:1."""
     stats: dict[str, dict[str, float | str]] = {}
@@ -270,13 +291,8 @@ def resolve_model_topology(
     else:
         attn_arg = attn_implementation
     return {
-        "resolved_id": resolved_id,
-        "model_type": model_type,
-        "num_layers": num_layers,
-        "is_moe": is_moe,
-        "split_layer": split_layer,
-        "device_map": device_map,
-        "attn_arg": attn_arg,
+        "resolved_id": resolved_id, "model_type": model_type, "num_layers": num_layers,
+        "is_moe": is_moe, "split_layer": split_layer, "device_map": device_map, "attn_arg": attn_arg,
     }
 
 
@@ -293,13 +309,8 @@ def load_sharded_lora_model_and_tokenizer(
     """Load base Gemma checkpoint (bfloat16 or QLoRA 4-bit NF4) across cuda:1 + cuda:0 with PEFT LoRA."""
     console = console or Console()
     topo = resolve_model_topology(model_id=model_id, attn_implementation=attn_implementation, load_in_4bit=load_in_4bit)
-    resolved_id = topo["resolved_id"]
-    model_type = topo["model_type"]
-    num_layers = topo["num_layers"]
-    is_moe = topo["is_moe"]
-    split_layer = topo["split_layer"]
-    device_map = topo["device_map"]
-    attn_arg = topo["attn_arg"]
+    resolved_id, model_type, num_layers = topo["resolved_id"], topo["model_type"], topo["num_layers"]
+    is_moe, split_layer, device_map, attn_arg = topo["is_moe"], topo["split_layer"], topo["device_map"], topo["attn_arg"]
     quant_label = "4-bit NF4 QLoRA" if load_in_4bit else "bfloat16"
     console.print(
         f"[bold cyan]Loading base model:[/bold cyan] [green]{resolved_id}[/green] "
@@ -331,7 +342,9 @@ def load_sharded_lora_model_and_tokenizer(
         base_model.config.text_config.use_cache = False
 
     install_chunked_causal_lm_loss(base_model, chunk_size=256)
-    base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    base_model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False, "context_fn": make_multigpu_rng_context_fn()}
+    )
     base_model.enable_input_require_grads()
 
     if adapter_path is not None:
@@ -340,13 +353,8 @@ def load_sharded_lora_model_and_tokenizer(
         lora_desc = f"pretrained={adapter_path}"
     else:
         lora_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=LORA_TARGET_MODULES,
-            exclude_modules=MULTIMODAL_EXCLUDE_REGEX,
+            r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout, bias="none",
+            task_type="CAUSAL_LM", target_modules=LORA_TARGET_MODULES, exclude_modules=MULTIMODAL_EXCLUDE_REGEX,
         )
         peft_model = get_peft_model(base_model, lora_config)
         lora_desc = f"r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}, targets={LORA_TARGET_MODULES}"
@@ -378,14 +386,8 @@ def load_sharded_lora_model_and_tokenizer(
     console.print(tbl)
 
     load_meta = {
-        "requested_model_id": model_id,
-        "resolved_model_id": resolved_id,
-        "model_type": model_type,
-        "is_moe": is_moe,
-        "load_in_4bit": load_in_4bit,
-        "attn_implementation": attn_arg,
-        "device_map": device_map,
-        "param_stats": param_stats,
-        "post_load_vram": vram_stats,
+        "requested_model_id": model_id, "resolved_model_id": resolved_id, "model_type": model_type,
+        "is_moe": is_moe, "load_in_4bit": load_in_4bit, "attn_implementation": attn_arg,
+        "device_map": device_map, "param_stats": param_stats, "post_load_vram": vram_stats,
     }
     return peft_model, tokenizer, load_meta

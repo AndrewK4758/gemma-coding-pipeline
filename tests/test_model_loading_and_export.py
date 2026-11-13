@@ -144,6 +144,34 @@ class TestModelLoadingAndExport(unittest.TestCase):
             self.assertIn(domain, combined)
         self.assertIn("google/gemma-4-26B-A4B-it", combined)
 
+    def test_multigpu_rng_context_fn_preserves_and_restores_all_device_states(self) -> None:
+        from train.model_loader import make_multigpu_rng_context_fn
+
+        fake_states = {0: torch.tensor([10], dtype=torch.uint8), 1: torch.tensor([20], dtype=torch.uint8)}
+
+        def _get(dev="cuda"):
+            return fake_states[int(dev)].clone()
+
+        def _set(st, dev="cuda"):
+            fake_states[int(dev)] = st.clone()
+
+        with (
+            mock.patch("train.model_loader.torch.cuda.is_available", return_value=True),
+            mock.patch("train.model_loader.torch.cuda.device_count", return_value=2),
+            mock.patch("train.model_loader.torch.cuda.get_rng_state", side_effect=_get),
+            mock.patch("train.model_loader.torch.cuda.set_rng_state", side_effect=_set),
+        ):
+            ctx_fn = make_multigpu_rng_context_fn()
+            fwd_ctx, rec_ctx = ctx_fn()
+            with fwd_ctx:
+                fake_states[0] = torch.tensor([99], dtype=torch.uint8)
+                fake_states[1] = torch.tensor([88], dtype=torch.uint8)
+            with rec_ctx:
+                self.assertEqual(int(fake_states[0].item()), 10)
+                self.assertEqual(int(fake_states[1].item()), 20)
+            self.assertEqual(int(fake_states[0].item()), 99)
+            self.assertEqual(int(fake_states[1].item()), 88)
+
 
 if __name__ == "__main__":
     unittest.main()

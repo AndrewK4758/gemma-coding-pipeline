@@ -49,6 +49,7 @@ from train.model_loader import (
     DEFAULT_MODEL_ID,
     get_input_device,
     load_sharded_lora_model_and_tokenizer,
+    make_multigpu_rng_context_fn,
     query_dual_gpu_vram,
 )
 
@@ -152,7 +153,9 @@ def generate_group_completions(
         causal_lm.config.use_cache = False
         if hasattr(causal_lm.config, "text_config"):
             causal_lm.config.text_config.use_cache = False
-        causal_lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        causal_lm.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False, "context_fn": make_multigpu_rng_context_fn()}
+        )
 
     return [tokenizer.decode(out_ids[i, prompt_len:], skip_special_tokens=True).strip() for i in range(num_generations)]
 
