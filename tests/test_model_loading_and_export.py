@@ -51,6 +51,51 @@ class TestModelLoadingAndExport(unittest.TestCase):
         self.assertEqual(topo["split_layer"], 26)
         self.assertEqual(topo["device_map"]["model.vision_tower"], 1)
 
+    def test_26b_topology_omits_absent_audio_and_ple_keys(self) -> None:
+        from train.model_loader import resolve_model_topology
+
+        moe_text_cfg = SimpleNamespace(
+            num_hidden_layers=30, enable_moe_block=True, num_experts=128, hidden_size_per_layer_input=0
+        )
+        fake_cfg = SimpleNamespace(model_type="gemma4", audio_config=None, get_text_config=lambda: moe_text_cfg)
+        with (
+            mock.patch("train.model_loader.resolve_checkpoint_id", return_value="google/gemma-4-26B-A4B-it"),
+            mock.patch("train.model_loader.AutoConfig.from_pretrained", return_value=fake_cfg),
+        ):
+            topo = resolve_model_topology("google/gemma-4-26B-A4B-it", load_in_4bit=True)
+        self.assertTrue(topo["is_moe"])
+        self.assertNotIn("model.audio_tower", topo["device_map"])
+        self.assertNotIn("model.language_model.embed_tokens_per_layer", topo["device_map"])
+        self.assertEqual(topo["device_map"]["model.language_model.layers.0.experts"], "cpu")
+
+    def test_quantize_moe_experts_reads_meta_offloaded_weights_map(self) -> None:
+        from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+        from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+        from train.moe_quant import QuantizedGemma4Experts4bit, quantize_gemma4_moe_experts_in_place
+
+        cfg = Gemma4TextConfig(
+            hidden_size=64, intermediate_size=128, moe_intermediate_size=64, num_hidden_layers=1,
+            num_attention_heads=2, num_key_value_heads=1, head_dim=32, global_head_dim=32,
+            vocab_size=128, enable_moe_block=True, num_experts=4, top_k_experts=2,
+            hidden_size_per_layer_input=0, num_kv_shared_layers=0, layer_types=["full_attention"],
+        )
+        model = Gemma4ForCausalLM(cfg).to(dtype=torch.bfloat16)
+        exp = model.model.layers[0].experts
+        add_hook_to_module(exp, AlignDevicesHook(execution_device="cpu", offload=True))
+        self.assertEqual(exp.gate_up_proj.device.type, "meta")
+        hook = exp._hf_hook
+
+        replaced = quantize_gemma4_moe_experts_in_place(model, layer_device_map={0: "cpu"})
+        self.assertEqual(replaced, 1)
+        q_exp = model.model.layers[0].experts
+        self.assertIsInstance(q_exp, QuantizedGemma4Experts4bit)
+        self.assertEqual(q_exp.gate_up_q_0.device.type, "cpu")
+        self.assertEqual(len(hook.weights_map), 0)
+
+        ids = torch.randint(0, 128, (1, 4))
+        out = model(input_ids=ids, labels=ids)
+        out.loss.backward()
+
     def test_get_input_device_skips_cpu_offloaded_vision_tower(self) -> None:
         from train.model_loader import get_input_device
 

@@ -78,20 +78,24 @@ def build_asymmetric_device_map(
     primary_gpu_max_layer: int = PRIMARY_GPU_MAX_LAYER,
     offload_multimodal: bool = False,
     offload_experts_to_cpu: bool = False,
+    include_audio: bool = True,
+    include_per_layer: bool = True,
 ) -> dict[str, int | str]:
     """Construct static asymmetric device_map across cuda:1 (16 GB) and cuda:0 (12 GB)."""
     if model_type == "gemma4":
         mm_dev: int | str = "cpu" if offload_multimodal else 1
         device_map: dict[str, int | str] = {
             "model.vision_tower": mm_dev,
-            "model.audio_tower": mm_dev,
             "model.embed_vision": mm_dev,
-            "model.embed_audio": mm_dev,
             "model.language_model.embed_tokens": 0,
-            "model.language_model.embed_tokens_per_layer": 1,
-            "model.language_model.per_layer_model_projection": 1,
-            "model.language_model.per_layer_projection_norm": 1,
         }
+        if include_audio:
+            device_map["model.audio_tower"] = mm_dev
+            device_map["model.embed_audio"] = mm_dev
+        if include_per_layer:
+            device_map["model.language_model.embed_tokens_per_layer"] = 1
+            device_map["model.language_model.per_layer_model_projection"] = 1
+            device_map["model.language_model.per_layer_projection_norm"] = 1
         for layer_idx in range(num_layers):
             target_gpu = 1 if layer_idx <= primary_gpu_max_layer else 0
             device_map[f"model.language_model.layers.{layer_idx}"] = target_gpu
@@ -251,19 +255,20 @@ def resolve_model_topology(
     num_layers = int(getattr(text_cfg, "num_hidden_layers", GEMMA_NUM_LAYERS) or GEMMA_NUM_LAYERS)
     num_experts = getattr(text_cfg, "num_experts", 0) or 0
     is_moe = bool(getattr(text_cfg, "enable_moe_block", False) or num_experts > 1)
+    has_audio = getattr(cfg, "audio_config", None) is not None
+    has_ple = bool(getattr(text_cfg, "hidden_size_per_layer_input", 0) or 0)
     split_layer = 21 if num_layers <= 30 else PRIMARY_GPU_MAX_LAYER
     device_map = build_asymmetric_device_map(
-        model_type=model_type,
-        num_layers=num_layers,
-        primary_gpu_max_layer=split_layer,
-        offload_multimodal=bool(load_in_4bit or is_moe),
-        offload_experts_to_cpu=bool(load_in_4bit and is_moe),
+        model_type=model_type, num_layers=num_layers, primary_gpu_max_layer=split_layer,
+        offload_multimodal=bool(load_in_4bit or is_moe), offload_experts_to_cpu=bool(load_in_4bit and is_moe),
+        include_audio=has_audio, include_per_layer=has_ple,
     )
-    attn_arg: str | dict[str, str] = (
-        {"text_config": attn_implementation, "vision_config": attn_implementation, "audio_config": "eager"}
-        if model_type == "gemma4" and attn_implementation == "sdpa"
-        else attn_implementation
-    )
+    if model_type == "gemma4" and attn_implementation == "sdpa":
+        attn_arg: str | dict[str, str] = {"text_config": attn_implementation, "vision_config": attn_implementation}
+        if has_audio:
+            attn_arg["audio_config"] = "eager"
+    else:
+        attn_arg = attn_implementation
     return {
         "resolved_id": resolved_id,
         "model_type": model_type,
@@ -287,11 +292,7 @@ def load_sharded_lora_model_and_tokenizer(
 ) -> tuple[PeftModel, PreTrainedTokenizerBase, dict[str, Any]]:
     """Load base Gemma checkpoint (bfloat16 or QLoRA 4-bit NF4) across cuda:1 + cuda:0 with PEFT LoRA."""
     console = console or Console()
-    topo = resolve_model_topology(
-        model_id=model_id,
-        attn_implementation=attn_implementation,
-        load_in_4bit=load_in_4bit,
-    )
+    topo = resolve_model_topology(model_id=model_id, attn_implementation=attn_implementation, load_in_4bit=load_in_4bit)
     resolved_id = topo["resolved_id"]
     model_type = topo["model_type"]
     num_layers = topo["num_layers"]
@@ -309,18 +310,11 @@ def load_sharded_lora_model_and_tokenizer(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    load_kwargs: dict[str, Any] = {
-        "dtype": torch.bfloat16,
-        "device_map": device_map,
-        "attn_implementation": attn_arg,
-    }
+    load_kwargs: dict[str, Any] = {"dtype": torch.bfloat16, "device_map": device_map, "attn_implementation": attn_arg}
     if load_in_4bit:
         load_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            llm_int8_enable_fp32_cpu_offload=True,
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16, llm_int8_enable_fp32_cpu_offload=True,
         )
 
     base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(resolved_id, **load_kwargs)

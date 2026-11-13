@@ -17,6 +17,48 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _resolve_target_device(target_device: torch.device | str | int | None) -> torch.device | None:
+    if target_device is None:
+        return None
+    if isinstance(target_device, int):
+        return torch.device(f"cuda:{target_device}")
+    return torch.device(target_device)
+
+
+def _extract_expert_tensor(experts_mod: nn.Module, attr_name: str) -> torch.Tensor:
+    """Return concrete expert weights, resolving Accelerate CPU-offloaded `weights_map` when on meta."""
+    tensor = getattr(experts_mod, attr_name).data
+    if tensor.device.type != "meta":
+        return tensor
+    hook = getattr(experts_mod, "_hf_hook", None)
+    hooks = getattr(hook, "hooks", [hook]) if hook is not None else []
+    for h in hooks:
+        wmap = getattr(h, "weights_map", None)
+        if wmap is not None and attr_name in wmap:
+            return wmap[attr_name]
+    raise RuntimeError(
+        f"Expert parameter {attr_name!r} is on meta device without a backing accelerate weights_map."
+    )
+
+
+def _release_offload_hooks(experts_mod: nn.Module) -> None:
+    """Release CPU-offloaded state tensors and Accelerate hooks once an expert layer is quantized."""
+    hook = getattr(experts_mod, "_hf_hook", None)
+    hooks = getattr(hook, "hooks", [hook]) if hook is not None else []
+    for h in hooks:
+        wmap = getattr(h, "weights_map", None)
+        if isinstance(wmap, dict):
+            wmap.pop("gate_up_proj", None)
+            wmap.pop("down_proj", None)
+    if hook is not None:
+        try:
+            from accelerate.hooks import remove_hook_from_module
+
+            remove_hook_from_module(experts_mod)
+        except Exception:
+            pass
+
+
 class QuantizedGemma4Experts4bit(nn.Module):
     """Memory-frugal 4-bit NF4 drop-in replacement for `Gemma4TextExperts`."""
 
@@ -26,6 +68,7 @@ class QuantizedGemma4Experts4bit(nn.Module):
         act_fn: nn.Module,
         gate_up_weight: torch.Tensor,
         down_weight: torch.Tensor,
+        target_device: torch.device | str | int | None = None,
         quant_type: str = "nf4",
         compress_statistics: bool = True,
         compute_dtype: torch.dtype = torch.bfloat16,
@@ -39,21 +82,32 @@ class QuantizedGemma4Experts4bit(nn.Module):
         self._gate_up_states: list[Any] = []
         self._down_states: list[Any] = []
         self.quantized_param_count = int(gate_up_weight.numel() + down_weight.numel())
+        dev = _resolve_target_device(target_device)
 
         for idx in range(self.num_experts):
-            gu_slice = gate_up_weight[idx].detach().to(dtype=compute_dtype).contiguous()
+            gu_slice = gate_up_weight[idx].detach()
+            if dev is not None and gu_slice.device != dev:
+                gu_slice = gu_slice.to(device=dev, dtype=compute_dtype).contiguous()
+            else:
+                gu_slice = gu_slice.to(dtype=compute_dtype).contiguous()
             gu_q, gu_state = F_bnb.quantize_4bit(
                 gu_slice, quant_type=quant_type, compress_statistics=compress_statistics
             )
             self.register_buffer(f"gate_up_q_{idx}", gu_q)
             self._gate_up_states.append(gu_state)
+            del gu_slice
 
-            dn_slice = down_weight[idx].detach().to(dtype=compute_dtype).contiguous()
+            dn_slice = down_weight[idx].detach()
+            if dev is not None and dn_slice.device != dev:
+                dn_slice = dn_slice.to(device=dev, dtype=compute_dtype).contiguous()
+            else:
+                dn_slice = dn_slice.to(dtype=compute_dtype).contiguous()
             dn_q, dn_state = F_bnb.quantize_4bit(
                 dn_slice, quant_type=quant_type, compress_statistics=compress_statistics
             )
             self.register_buffer(f"down_q_{idx}", dn_q)
             self._down_states.append(dn_state)
+            del dn_slice
 
     @classmethod
     def from_float_experts(
@@ -63,18 +117,15 @@ class QuantizedGemma4Experts4bit(nn.Module):
         quant_type: str = "nf4",
         compute_dtype: torch.dtype = torch.bfloat16,
     ) -> "QuantizedGemma4Experts4bit":
-        """Quantize a `Gemma4TextExperts` module, optionally staging one layer onto target_device."""
-        gate_up = experts_mod.gate_up_proj.data
-        down = experts_mod.down_proj.data
-        if target_device is not None:
-            dev = torch.device(f"cuda:{target_device}") if isinstance(target_device, int) else torch.device(target_device)
-            gate_up = gate_up.to(device=dev)
-            down = down.to(device=dev)
+        """Quantize a `Gemma4TextExperts` module slice-by-slice onto target_device."""
+        gate_up = _extract_expert_tensor(experts_mod, "gate_up_proj")
+        down = _extract_expert_tensor(experts_mod, "down_proj")
         return cls(
             num_experts=experts_mod.num_experts,
             act_fn=experts_mod.act_fn,
             gate_up_weight=gate_up,
             down_weight=down,
+            target_device=target_device,
             quant_type=quant_type,
             compress_statistics=True,
             compute_dtype=compute_dtype,
@@ -152,6 +203,7 @@ def quantize_gemma4_moe_experts_in_place(
             experts, target_device=target_dev, compute_dtype=compute_dtype
         )
         layer.experts = q_experts
+        _release_offload_hooks(experts)
         if target_dev is not None and isinstance(getattr(model, "hf_device_map", None), dict):
             model.hf_device_map[f"model.language_model.layers.{idx}.experts"] = target_dev
         del experts
