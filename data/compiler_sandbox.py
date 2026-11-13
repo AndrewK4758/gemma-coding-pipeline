@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """32-thread parallel compiler verification sandbox & DPO mutation synthesizer.
 
-Verifies fenced TypeScript, Go, and C#/.NET 10 code blocks against real toolchains:
+Verifies fenced TypeScript, Go, and C#/.NET code blocks against real toolchains:
 - Go         : gofmt -e (AST/syntax) + go build / go vet in isolated temp module
 - TypeScript : TypeScript 6.0.3 compiler API (ts.createProgram + ts.transpileModule) via Node v26
-- C#/.NET 10 : .NET 10.0.400 Roslyn compiler (csc.dll + Microsoft.NETCore.App.Ref net10.0 assemblies)
-
-Also synthesizes realistic compiler-failing mutations (type mismatch, wrong return type, syntax corruption)
-and verifies them through the same 32-thread sandbox to build Stage 4 Compiler-Verified DPO pairs.
+- C#/.NET    : Active .NET Roslyn compiler (csc.dll + paired Microsoft.NETCore.App.Ref assemblies)
+Synthesizes compiler-failing mutations and runs the 32-thread sandbox for Stage 4 DPO pairs.
 """
 
 from __future__ import annotations
@@ -64,31 +62,36 @@ class SandboxResult:
     toolchain: str
 
 
-def _prepare_roslyn_env() -> tuple[str, str] | None:
-    """Locate .NET 10 Roslyn csc.dll and generate a shared reference assembly response file."""
-    roots = [r for r in (os.environ.get("DOTNET_ROOT", ""), str(Path.home() / ".dotnet"), "/usr/share/dotnet") if r]
-    if shutil.which("dotnet"):
-        try:
-            sdk_proc = subprocess.run(["dotnet", "--list-sdks"], capture_output=True, text=True, timeout=5, check=False)
-            for line in sdk_proc.stdout.splitlines():
-                m = re.search(r"\[([^\]]+)\]", line)
-                if m:
-                    roots.insert(0, str(Path(m.group(1)).parent))
-        except OSError:
-            pass
-    csc_matches = [m for r in dict.fromkeys(roots) for m in sorted(glob.glob(f"{r}/sdk/*/Roslyn/bincore/csc.dll"))]
-    ref_matches = [m for r in dict.fromkeys(roots) for m in sorted(glob.glob(f"{r}/packs/Microsoft.NETCore.App.Ref/*/ref/net10.0/*.dll"))]
-    if not csc_matches or not ref_matches:
-        return None
-    rsp_path = Path(tempfile.gettempdir()) / "gemma_pipeline_net10_refs.rsp"
-    if not rsp_path.exists():
-        lines = ["-target:library", "-nologo", "-langversion:preview", "-nullable:enable"]
-        lines.extend(f"-r:{dll}" for dll in ref_matches)
-        rsp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return csc_matches[-1], str(rsp_path)
+def _prepare_roslyn_env(preferred_roots: list[str] | None = None) -> tuple[str, str, str, str] | None:
+    """Locate active .NET Roslyn csc.dll and paired reference assemblies from the same SDK root."""
+    from data.dotnet_env import ordered_dotnet_roots
+
+    roots = [Path(r) for r in preferred_roots] if preferred_roots is not None else ordered_dotnet_roots()
+    for root in roots:
+        csc_matches = sorted(root.glob("sdk/*/Roslyn/bincore/csc.dll"))
+        ref_dirs = sorted(d for d in root.glob("packs/Microsoft.NETCore.App.Ref/*/ref/net*") if d.is_dir())
+        if not csc_matches or not ref_dirs:
+            continue
+        ref_dir = ref_dirs[-1]
+        ref_dlls = sorted(ref_dir.glob("*.dll"))
+        if not ref_dlls:
+            continue
+        tfm = ref_dir.name
+        major = tfm.removeprefix("net").split(".")[0] or "10"
+        root_tag = re.sub(r"[^a-zA-Z0-9._-]+", "_", root.name or "default")
+        rsp_path = Path(tempfile.gettempdir()) / f"gemma_pipeline_{tfm}_{root_tag}_refs.rsp"
+        if not rsp_path.exists():
+            lines = ["-target:library", "-nologo", "-langversion:preview", "-nullable:enable"]
+            lines.extend(f"-r:{dll}" for dll in ref_dlls)
+            rsp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        dotnet_bin = str(root / "dotnet") if (root / "dotnet").is_file() else shutil.which("dotnet")
+        if dotnet_bin and Path(dotnet_bin).is_absolute():
+            return str(csc_matches[-1]), str(rsp_path), f"dotnet-{major}-roslyn-csc", dotnet_bin
+    return None
 
 
-ROSLYN_ENV = _prepare_roslyn_env()
+_ROSLYN_SPEC = _prepare_roslyn_env()
+ROSLYN_ENV = _ROSLYN_SPEC[:2] if _ROSLYN_SPEC is not None else None
 
 
 def _wrap_go_snippet(code: str) -> str:
@@ -201,10 +204,10 @@ def _wrap_csharp_snippet(code: str) -> str:
 
 
 def verify_csharp_code(code: str) -> SandboxResult:
-    """Verify C#/.NET 10 code using Roslyn csc.dll against net10.0 reference assemblies."""
-    if ROSLYN_ENV is None:
-        return SandboxResult(passed=False, language="csharp", diagnostics="Missing .NET 10 Roslyn SDK", toolchain="roslyn")
-    csc_dll, rsp_file = ROSLYN_ENV
+    """Verify C# code using active Roslyn csc.dll against matching .NET reference assemblies."""
+    if _ROSLYN_SPEC is None:
+        return SandboxResult(passed=False, language="csharp", diagnostics="Missing .NET Roslyn SDK", toolchain="roslyn")
+    csc_dll, rsp_file, toolchain_label, dotnet_bin = _ROSLYN_SPEC
     wrapped = _wrap_csharp_snippet(code)
 
     with tempfile.TemporaryDirectory(prefix="sandbox_cs_") as tmpdir:
@@ -213,7 +216,7 @@ def verify_csharp_code(code: str) -> SandboxResult:
         cs_file.write_text(wrapped, encoding="utf-8")
 
         proc = subprocess.run(
-            ["dotnet", csc_dll, f"@{rsp_file}", f"-out:{out_dll}", str(cs_file)],
+            [dotnet_bin, csc_dll, f"@{rsp_file}", f"-out:{out_dll}", str(cs_file)],
             capture_output=True,
             text=True,
             timeout=15,
@@ -235,10 +238,10 @@ def verify_csharp_code(code: str) -> SandboxResult:
                 passed=False,
                 language="csharp",
                 diagnostics="\n".join(fatal_lines[:4]),
-                toolchain="dotnet-10-roslyn-csc",
+                toolchain=toolchain_label,
             )
 
-    return SandboxResult(passed=True, language="csharp", diagnostics="OK", toolchain="dotnet-10-roslyn-csc")
+    return SandboxResult(passed=True, language="csharp", diagnostics="OK", toolchain=toolchain_label)
 
 
 def verify_cpp_code(code: str, language: str = "cpp") -> SandboxResult:

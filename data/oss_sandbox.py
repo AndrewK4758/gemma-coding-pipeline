@@ -11,6 +11,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from data.dotnet_env import _parse_semver, discover_dotnet_sdks, resolve_dotnet_build_spec
+
 DIFF_FENCE_RE = re.compile(r"```(?:diff|patch)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 DEFAULT_TIMEOUTS = {"dotnet": 90, "react": 60, "go": 60, "cpp": 90}
 
@@ -57,11 +59,18 @@ def _symlink_node_modules(repo_dir: Path, wt_dir: Path) -> None:
             os.symlink(nm_src, dst)
 
 
-def _run_cmd(cmd: list[str], cwd: Path, timeout: float, stdin_text: str | None = None) -> subprocess.CompletedProcess[str]:
+def _run_cmd(
+    cmd: list[str],
+    cwd: Path,
+    timeout: float,
+    stdin_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
         cwd=str(cwd),
         input=stdin_text,
+        env=env,
         capture_output=True,
         text=True,
         timeout=max(1.0, timeout),
@@ -116,24 +125,30 @@ def _verify_dotnet_worktree(
     test_filter: str,
     deadline: float,
 ) -> tuple[bool, str]:
-    dotnet_bin = shutil.which("dotnet")
-    if not dotnet_bin:
+    spec = resolve_dotnet_build_spec(wt_dir)
+    if not spec.dotnet_bin:
         return False, ".NET verification failed: dotnet CLI not found"
 
     has_assets = any(wt_dir.rglob("project.assets.json"))
     logs: list[str] = []
     if not has_assets:
-        restore_cmd = [dotnet_bin, "restore", "--ignore-failed-sources"]
+        restore_cmd = [spec.dotnet_bin, "restore"]
+        if spec.target:
+            restore_cmd.append(spec.target)
+        restore_cmd.append("--ignore-failed-sources")
         nuget_cache = Path.home() / ".nuget" / "packages"
         if nuget_cache.is_dir():
             restore_cmd.extend(["--source", str(nuget_cache)])
-        rest = _run_cmd(restore_cmd, wt_dir, deadline - time.monotonic())
+        rest = _run_cmd(restore_cmd, wt_dir, deadline - time.monotonic(), env=spec.env)
         logs.append((rest.stdout + "\n" + rest.stderr).strip())
 
-    test_cmd = [dotnet_bin, "test", "--no-restore", "-v", "minimal"]
+    test_cmd = [spec.dotnet_bin, "test"]
+    if spec.target:
+        test_cmd.extend(["--solution", spec.target] if spec.use_mtp_solution_flag else [spec.target])
+    test_cmd.extend(["--no-restore", "-v", "minimal"])
     if test_filter:
         test_cmd.extend(["--filter", test_filter])
-    proc = _run_cmd(test_cmd, wt_dir, deadline - time.monotonic())
+    proc = _run_cmd(test_cmd, wt_dir, deadline - time.monotonic(), env=spec.env)
     logs.append((proc.stdout + "\n" + proc.stderr).strip())
     output = "\n".join(x for x in logs if x)[-2000:]
     return proc.returncode == 0, output or "dotnet test passed"
