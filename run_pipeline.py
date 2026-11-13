@@ -3,7 +3,7 @@
 
 Orchestrates all pipeline stages (`data`, `sft`, `dpo`, `grpo`, `eval`, `export`) across scale tiers
 (`smoke`, `dev`, `full`) with automatic Dual-GPU mode switching (`./scripts/gpu-mode.zsh`) and a
-guaranteed `try...finally` restoration of `local-ai-offload.service` (`http://127.0.0.1:11434/health`).
+guaranteed `try...finally` restoration of any optional `$LOCAL_OFFLOAD_SERVICE` endpoint.
 
 Usage:
     .venv/bin/python run_pipeline.py --tier smoke --stages eval,export
@@ -28,7 +28,7 @@ from rich.table import Table
 
 REPO_ROOT = Path(__file__).resolve().parent
 GPU_MODE_SCRIPT = REPO_ROOT / "scripts" / "gpu-mode.zsh"
-HEALTH_URL = "http://127.0.0.1:11434/health"
+HEALTH_URL = os.environ.get("INFERENCE_HEALTH_URL", "http://127.0.0.1:11434/health")
 
 VALID_STAGES = ("data", "sft", "dpo", "grpo", "eval", "export")
 GPU_STAGES = {"sft", "dpo", "grpo", "eval", "export"}
@@ -79,13 +79,34 @@ def run_stage_command(stage: str, cmd: list[str], console: Console, dry_run: boo
 
 
 def build_stage_commands(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
-    """Construct ordered stage command invocations for the requested --tier and --stages."""
+    """Construct ordered stage command invocations for the requested tier, domain, and model."""
+    from data.build_dataset import resolve_processed_dir
+
     py = sys.executable
     t_cfg = TIER_DEFAULTS[args.tier]
+    is_26b = "26b" in args.model_id.lower()
+    use_4bit = bool(getattr(args, "load_in_4bit", False) or is_26b)
+    domain = getattr(args, "domain", "all")
+    oss_only = bool(getattr(args, "oss_only", False))
+    adapter_name = getattr(args, "adapter_name", None) or (
+        domain if domain in ("dotnet", "react", "go", "cpp") else ("oss" if oss_only or domain == "oss" else None)
+    )
+    data_dir = str(resolve_processed_dir(args.tier, domain=domain, oss_only=oss_only))
+
     sft_steps = args.sft_steps if args.sft_steps is not None else t_cfg["sft_steps"]
     dpo_steps = args.dpo_steps if args.dpo_steps is not None else t_cfg["dpo_steps"]
     grpo_steps = args.grpo_steps if args.grpo_steps is not None else t_cfg["grpo_steps"]
-    seq_len = args.max_seq_length if args.max_seq_length is not None else t_cfg["max_seq_len"]
+    seq_len = args.max_seq_length if args.max_seq_length is not None else (
+        min(4096, t_cfg["max_seq_len"]) if is_26b else t_cfg["max_seq_len"]
+    )
+    sft_lr, dpo_lr = ("1e-4", "2e-5") if use_4bit else ("2e-4", "5e-5")
+    grad_accum = "16" if use_4bit else "8"
+
+    shared_train: list[str] = ["--tier", args.tier, "--model-id", args.model_id, "--data-dir", data_dir]
+    if adapter_name:
+        shared_train.extend(["--adapter-name", adapter_name])
+    if use_4bit:
+        shared_train.append("--load-in-4bit")
 
     requested = [s.strip().lower() for s in args.stages.split(",") if s.strip()]
     for s in requested:
@@ -95,22 +116,20 @@ def build_stage_commands(args: argparse.Namespace) -> list[tuple[str, list[str]]
     plan: list[tuple[str, list[str]]] = []
     for stage in requested:
         if stage == "data":
-            plan.append(("data", [py, "data/build_dataset.py", "--tier", args.tier]))
+            cmd = [py, "data/build_dataset.py", "--tier", args.tier, "--domain", domain, "--output-dir", data_dir]
+            if oss_only:
+                cmd.append("--oss-only")
+            if getattr(args, "oss_corpus_root", None):
+                cmd.extend(["--oss-corpus-root", args.oss_corpus_root])
+            plan.append(("data", cmd))
         elif stage == "sft":
             plan.append(
                 (
                     "sft",
                     [
-                        py,
-                        "train/sft_lora.py",
-                        "--tier",
-                        args.tier,
-                        "--model-id",
-                        args.model_id,
-                        "--max-seq-length",
-                        str(seq_len),
-                        "--max-steps",
-                        str(sft_steps),
+                        py, "train/sft_lora.py", *shared_train,
+                        "--max-seq-length", str(seq_len), "--max-steps", str(sft_steps),
+                        "--learning-rate", sft_lr, "--gradient-accumulation-steps", grad_accum,
                     ],
                 )
             )
@@ -119,16 +138,9 @@ def build_stage_commands(args: argparse.Namespace) -> list[tuple[str, list[str]]
                 (
                     "dpo",
                     [
-                        py,
-                        "train/dpo_compiler.py",
-                        "--tier",
-                        args.tier,
-                        "--model-id",
-                        args.model_id,
-                        "--max-seq-length",
-                        str(seq_len),
-                        "--max-steps",
-                        str(dpo_steps),
+                        py, "train/dpo_compiler.py", *shared_train,
+                        "--max-seq-length", str(seq_len), "--max-steps", str(dpo_steps),
+                        "--learning-rate", dpo_lr,
                     ],
                 )
             )
@@ -136,64 +148,42 @@ def build_stage_commands(args: argparse.Namespace) -> list[tuple[str, list[str]]
             plan.append(
                 (
                     "grpo",
-                    [
-                        py,
-                        "train/grpo_online.py",
-                        "--tier",
-                        args.tier,
-                        "--model-id",
-                        args.model_id,
-                        "--max-steps",
-                        str(grpo_steps),
-                    ],
+                    [py, "train/grpo_online.py", *shared_train, "--max-steps", str(grpo_steps)],
                 )
             )
         elif stage == "eval":
-            plan.append(
-                (
-                    "eval",
-                    [
-                        py,
-                        "eval/benchmark_coding.py",
-                        "--tier",
-                        args.tier,
-                        "--model-id",
-                        args.model_id,
-                    ],
-                )
-            )
+            plan.append(("eval", [py, "eval/benchmark_coding.py", *shared_train]))
         elif stage == "export":
-            plan.append(
-                (
-                    "export",
-                    [
-                        py,
-                        "export/merge_and_quantize_gguf.py",
-                        "--tier",
-                        args.tier,
-                        "--model-id",
-                        args.model_id,
-                    ],
-                )
-            )
+            exp_cmd = [py, "export/merge_and_quantize_gguf.py", "--tier", args.tier, "--model-id", args.model_id, "--data-dir", data_dir]
+            if adapter_name:
+                exp_cmd.extend(["--adapter-name", adapter_name])
+            plan.append(("export", exp_cmd))
     return plan
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="End-to-End Gemma Coding Fine-Tuning Pipeline Orchestrator.")
     parser.add_argument("--tier", choices=("smoke", "dev", "full"), default="smoke", help="Dataset & training scale tier.")
     parser.add_argument(
-        "--stages",
-        default="data,sft,dpo,eval,export",
+        "--stages", "--stage", dest="stages", default="data,sft,dpo,eval,export",
         help="Comma-separated stages to execute (subset of: data,sft,dpo,grpo,eval,export).",
     )
     parser.add_argument("--model-id", default="google/gemma-4-E4B-it", help="Base Hugging Face model ID.")
+    parser.add_argument("--domain", choices=("all", "dotnet", "react", "go", "cpp", "general", "oss"), default="all")
+    parser.add_argument("--adapter-name", default=None, help="Named domain LoRA suffix (e.g. dotnet, react, go, cpp).")
+    parser.add_argument("--oss-only", action="store_true", help="Train solely on mined OSS repos.")
+    parser.add_argument(
+        "--oss-corpus-root",
+        default=os.environ.get("OSS_CORPUS_DIR", str(Path.home() / "corpus" / "oss_repos")),
+        help="Root of cloned OSS corpus.",
+    )
+    parser.add_argument("--load-in-4bit", action="store_true", help="Enable 4-bit NF4 QLoRA loading (auto on 26B-A4B).")
     parser.add_argument("--sft-steps", type=int, default=None, help="Override SFT max_steps.")
     parser.add_argument("--dpo-steps", type=int, default=None, help="Override DPO max_steps.")
     parser.add_argument("--grpo-steps", type=int, default=None, help="Override GRPO max_steps.")
     parser.add_argument("--max-seq-length", type=int, default=None, help="Override max sequence length.")
     parser.add_argument("--dry-run", action="store_true", help="Print stage execution plan without running.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:
@@ -245,7 +235,7 @@ def main() -> int:
     )
     console.print(
         f"[bold green]Pipeline finished in {time.time() - t0:.1f}s[/bold green] | "
-        f"llama-swap (:11434/health)={'OK' if healthy else 'DOWN'} | Summary: {summary_path}"
+        f"inference_endpoint={'OK' if healthy else 'DOWN'} | Summary: {summary_path}"
     )
     return 0 if healthy else 1
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dual-GPU Blackwell (RTX 5080 16GB + RTX 5070 Ti 12GB) bfloat16 model & PEFT LoRA loader.
+"""Dual-GPU (`cuda:1` 16 GB + `cuda:0` 12 GB) bfloat16 & 4-bit QLoRA model loader.
 
 Supports both:
 - `google/gemma-4-E4B-it` (default: 8.0B total parameters, 42 layers, Per-Layer Embeddings + KV sharing)
@@ -28,17 +28,20 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
+    BitsAndBytesConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+from train.moe_quant import quantize_gemma4_moe_experts_in_place
 
 DEFAULT_MODEL_ID = "google/gemma-4-E4B-it"
 GEMMA2_GATED_ID = "google/gemma-2-9b-it"
 GEMMA2_MIRROR_ID = "unsloth/gemma-2-9b-it"
 
 GEMMA_NUM_LAYERS = 42
-RTX_5080_MAX_LAYER = 26  # Layers 0..26 (27 layers) on cuda:1 (RTX 5080 16GB); Layers 27..41 (15 layers) on cuda:0
+PRIMARY_GPU_MAX_LAYER = 26  # Layers 0..26 (27 layers) on cuda:1 (16 GB); Layers 27..41 (15 layers) on cuda:0
 
 LORA_TARGET_MODULES: list[str] = [
     "q_proj",
@@ -72,22 +75,28 @@ def resolve_checkpoint_id(requested_model_id: str = DEFAULT_MODEL_ID) -> str:
 def build_asymmetric_device_map(
     model_type: str = "gemma4",
     num_layers: int = GEMMA_NUM_LAYERS,
-    rtx_5080_max_layer: int = RTX_5080_MAX_LAYER,
-) -> dict[str, int]:
-    """Construct static 42-layer asymmetric device_map across cuda:1 (RTX 5080 16GB) and cuda:0 (RTX 5070 Ti 12GB)."""
+    primary_gpu_max_layer: int = PRIMARY_GPU_MAX_LAYER,
+    offload_multimodal: bool = False,
+    offload_experts_to_cpu: bool = False,
+) -> dict[str, int | str]:
+    """Construct static asymmetric device_map across cuda:1 (16 GB) and cuda:0 (12 GB)."""
     if model_type == "gemma4":
-        device_map: dict[str, int] = {
-            "model.vision_tower": 1,
-            "model.audio_tower": 1,
-            "model.embed_vision": 1,
-            "model.embed_audio": 1,
+        mm_dev: int | str = "cpu" if offload_multimodal else 1
+        device_map: dict[str, int | str] = {
+            "model.vision_tower": mm_dev,
+            "model.audio_tower": mm_dev,
+            "model.embed_vision": mm_dev,
+            "model.embed_audio": mm_dev,
             "model.language_model.embed_tokens": 0,
             "model.language_model.embed_tokens_per_layer": 1,
             "model.language_model.per_layer_model_projection": 1,
             "model.language_model.per_layer_projection_norm": 1,
         }
         for layer_idx in range(num_layers):
-            device_map[f"model.language_model.layers.{layer_idx}"] = 1 if layer_idx <= rtx_5080_max_layer else 0
+            target_gpu = 1 if layer_idx <= primary_gpu_max_layer else 0
+            device_map[f"model.language_model.layers.{layer_idx}"] = target_gpu
+            if offload_experts_to_cpu:
+                device_map[f"model.language_model.layers.{layer_idx}.experts"] = "cpu"
         device_map["model.language_model.norm"] = 0
         device_map["model.language_model.rotary_emb"] = 0
         device_map["lm_head"] = 0
@@ -95,7 +104,7 @@ def build_asymmetric_device_map(
 
     device_map = {"model.embed_tokens": 0}
     for layer_idx in range(num_layers):
-        device_map[f"model.layers.{layer_idx}"] = 1 if layer_idx <= rtx_5080_max_layer else 0
+        device_map[f"model.layers.{layer_idx}"] = 1 if layer_idx <= primary_gpu_max_layer else 0
     device_map["model.norm"] = 0
     device_map["model.rotary_emb"] = 0
     device_map["lm_head"] = 0
@@ -218,37 +227,63 @@ def load_sharded_lora_model_and_tokenizer(
     lora_dropout: float = 0.05,
     attn_implementation: str = "sdpa",
     adapter_path: str | os.PathLike[str] | None = None,
+    load_in_4bit: bool = False,
     console: Console | None = None,
 ) -> tuple[PeftModel, PreTrainedTokenizerBase, dict[str, Any]]:
-    """Load base Gemma checkpoint in bfloat16 across cuda:1 + cuda:0 and attach or load rank-32 PEFT LoRA adapters."""
+    """Load base Gemma checkpoint (bfloat16 or QLoRA 4-bit NF4) across cuda:1 + cuda:0 with PEFT LoRA."""
     console = console or Console()
     resolved_id = resolve_checkpoint_id(model_id)
     cfg = AutoConfig.from_pretrained(resolved_id)
     model_type = getattr(cfg, "model_type", "gemma4")
     text_cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
     num_layers = getattr(text_cfg, "num_hidden_layers", GEMMA_NUM_LAYERS)
+    is_moe = bool(getattr(text_cfg, "enable_moe_block", False) or getattr(text_cfg, "num_experts", 0) > 1)
+    split_layer = 21 if num_layers <= 30 else PRIMARY_GPU_MAX_LAYER
 
-    device_map = build_asymmetric_device_map(model_type=model_type, num_layers=num_layers)
+    device_map = build_asymmetric_device_map(
+        model_type=model_type,
+        num_layers=num_layers,
+        primary_gpu_max_layer=split_layer,
+        offload_multimodal=bool(load_in_4bit or is_moe),
+        offload_experts_to_cpu=bool(load_in_4bit and is_moe),
+    )
     attn_arg: str | dict[str, str] = (
         {"text_config": attn_implementation, "vision_config": attn_implementation, "audio_config": "eager"}
         if model_type == "gemma4" and attn_implementation == "sdpa"
         else attn_implementation
     )
+    quant_label = "4-bit NF4 QLoRA" if load_in_4bit else "bfloat16"
     console.print(
         f"[bold cyan]Loading base model:[/bold cyan] [green]{resolved_id}[/green] "
-        f"(model_type={model_type}, layers={num_layers}, dtype=bfloat16, attn={attn_arg})"
+        f"(model_type={model_type}, layers={num_layers}, moe={is_moe}, precision={quant_label}, attn={attn_arg})"
     )
 
     tokenizer = AutoTokenizer.from_pretrained(str(adapter_path) if adapter_path else resolved_id)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-        resolved_id,
-        dtype=torch.bfloat16,
-        device_map=device_map,
-        attn_implementation=attn_arg,
-    )
+    load_kwargs: dict[str, Any] = {
+        "dtype": torch.bfloat16,
+        "device_map": device_map,
+        "attn_implementation": attn_arg,
+    }
+    if load_in_4bit:
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            llm_int8_enable_fp32_cpu_offload=True,
+        )
+
+    base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(resolved_id, **load_kwargs)
+    if load_in_4bit and is_moe:
+        layer_devs = {i: (1 if i <= split_layer else 0) for i in range(num_layers)}
+        replaced = quantize_gemma4_moe_experts_in_place(base_model, layer_device_map=layer_devs)
+        console.print(f"[cyan]Quantized {replaced} Gemma 4 MoE expert layers to 4-bit NF4 on target GPUs.[/cyan]")
+
+    for param in base_model.parameters():
+        param.requires_grad_(False)
 
     base_model.config.use_cache = False
     if hasattr(base_model.config, "text_config"):
@@ -285,7 +320,7 @@ def load_sharded_lora_model_and_tokenizer(
     tbl = Table(title=f"Sharded Model & LoRA Summary ({resolved_id})")
     tbl.add_column("Metric", style="cyan")
     tbl.add_column("Value", style="green")
-    tbl.add_row("Resolved Model ID", f"{resolved_id} ({model_type})")
+    tbl.add_row("Resolved Model ID", f"{resolved_id} ({model_type}, {quant_label})")
     tbl.add_row("Attention Backend", f"{attn_arg} + 256-Token Chunked Vocab Cross-Entropy")
     tbl.add_row("LoRA Config", lora_desc)
     tbl.add_row(
@@ -305,6 +340,8 @@ def load_sharded_lora_model_and_tokenizer(
         "requested_model_id": model_id,
         "resolved_model_id": resolved_id,
         "model_type": model_type,
+        "is_moe": is_moe,
+        "load_in_4bit": load_in_4bit,
         "attn_implementation": attn_arg,
         "device_map": device_map,
         "param_stats": param_stats,

@@ -2,8 +2,8 @@
 """Phase 4A Dual-GPU bfloat16 Compiler-Verified Direct Preference Optimization (DPO).
 
 Loads the Phase 3 SFT LoRA adapter (`checkpoints/sft-<tier>/final_adapter`) atop the
-42-layer asymmetrically sharded `google/gemma-4-E4B-it` backbone (`cuda:1` RTX 5080 16GB +
-`cuda:0` RTX 5070 Ti 12GB) and aligns the policy on compiler-verified `(prompt, chosen, rejected)`
+42-layer asymmetrically sharded `google/gemma-4-E4B-it` backbone (`cuda:1` 16 GB +
+`cuda:0` 12 GB) and aligns the policy on compiler-verified `(prompt, chosen, rejected)`
 preference pairs using 256-token chunked sequence log-probabilities (`compute_chunked_sequence_logps`).
 
 Usage:
@@ -42,7 +42,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.build_dataset import format_gemma2_chat_and_mask_labels
+from data.build_dataset import format_gemma2_chat_and_mask_labels, format_gemma_messages_and_mask_labels
 from train.model_loader import (
     DEFAULT_MODEL_ID,
     load_sharded_lora_model_and_tokenizer,
@@ -57,10 +57,15 @@ def _pad_to_multiple(seq: list[int], pad_val: int, multiple: int = 8) -> list[in
 
 
 def _encode_padded_tensors(
-    prompt: str, response: str, tokenizer: PreTrainedTokenizerBase, max_seq_length: int
+    prompt: str | list[dict[str, str]], response: str, tokenizer: PreTrainedTokenizerBase, max_seq_length: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     pad_id = int(tokenizer.pad_token_id or 0)
-    tok = format_gemma2_chat_and_mask_labels(prompt, response, tokenizer=tokenizer, max_seq_len=max_seq_length)
+    if isinstance(prompt, list):
+        tok = format_gemma_messages_and_mask_labels(
+            [*prompt, {"role": "assistant", "content": response}], tokenizer=tokenizer, max_seq_len=max_seq_length
+        )
+    else:
+        tok = format_gemma2_chat_and_mask_labels(prompt, response, tokenizer=tokenizer, max_seq_len=max_seq_length)
     ids = _pad_to_multiple(list(tok["input_ids"]), pad_id, 8)
     mask = _pad_to_multiple(list(tok["attention_mask"]), 0, 8)
     lbls = _pad_to_multiple(list(tok["labels"]), -100, 8)
@@ -221,6 +226,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Phase 4A Dual-GPU Compiler-Verified DPO Trainer.")
     parser.add_argument("--tier", choices=("smoke", "dev", "full"), default="smoke")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--adapter-name", default=None)
+    parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--sft-adapter", default=None)
     parser.add_argument("--max-seq-length", type=int, default=4096)
     parser.add_argument("--max-steps", type=int, default=15)
@@ -236,26 +244,26 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    console = Console()
-    t0 = time.time()
+    console, t0 = Console(), time.time()
     random.seed(42)
     torch.manual_seed(42)
 
-    sft_adapter_dir = Path(args.sft_adapter) if args.sft_adapter else (REPO_ROOT / "checkpoints" / f"sft-{args.tier}" / "final_adapter")
+    suffix = f"{args.tier}-{args.adapter_name}" if args.adapter_name else args.tier
+    sft_adapter_dir = Path(args.sft_adapter) if args.sft_adapter else (REPO_ROOT / "checkpoints" / f"sft-{suffix}" / "final_adapter")
     if not sft_adapter_dir.exists():
         raise FileNotFoundError(f"Phase 3 SFT adapter not found at {sft_adapter_dir}")
 
-    output_dir = Path(args.output_dir) if args.output_dir else (REPO_ROOT / "checkpoints" / f"dpo-{args.tier}")
-    logging_dir = Path(args.logging_dir) if args.logging_dir else (REPO_ROOT / "runs" / f"dpo-{args.tier}")
+    output_dir = Path(args.output_dir) if args.output_dir else (REPO_ROOT / "checkpoints" / f"dpo-{suffix}")
+    logging_dir = Path(args.logging_dir) if args.logging_dir else (REPO_ROOT / "runs" / f"dpo-{suffix}")
     output_dir.mkdir(parents=True, exist_ok=True)
     logging_dir.mkdir(parents=True, exist_ok=True)
 
-    console.rule(f"[bold cyan]Phase 4A Compiler-Verified Offline DPO — Tier: {args.tier.upper()} (beta={args.beta})")
+    console.rule(f"[bold cyan]Phase 4A DPO — Tier: {args.tier.upper()} ({args.model_id}, beta={args.beta})")
     model, tokenizer, load_meta = load_sharded_lora_model_and_tokenizer(
-        model_id=args.model_id, adapter_path=sft_adapter_dir, console=console
+        model_id=args.model_id, adapter_path=sft_adapter_dir, load_in_4bit=args.load_in_4bit, console=console
     )
 
-    data_dir = REPO_ROOT / "data" / "processed" / args.tier
+    data_dir = Path(args.data_dir) if args.data_dir else (REPO_ROOT / "data" / "processed" / args.tier)
     all_train = load_dpo_split(data_dir / "dpo_train.parquet", tokenizer, max_seq_length=args.max_seq_length)
     eval_samples = load_dpo_split(data_dir / "dpo_eval.parquet", tokenizer, max_seq_length=args.max_seq_length)
     random.Random(42).shuffle(all_train)
@@ -362,33 +370,19 @@ def main() -> int:
     tb_writer.flush()
     tb_writer.close()
 
+    payload = {
+        "tier": args.tier, "elapsed_sec": round(time.time() - t0, 2), "beta": args.beta, "ref_mode": args.ref_mode,
+        "sft_adapter_dir": str(sft_adapter_dir), "final_adapter_dir": str(final_adapter_dir),
+        "max_steps": total_steps, "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "learning_rate": args.learning_rate, "pre_dpo_eval": pre_eval, "post_dpo_eval": post_eval,
+        "eval_loss_delta": round(post_eval["eval_loss"] - pre_eval["eval_loss"], 4),
+        "reward_margin_delta": round(post_eval["rewards/margins"] - pre_eval["rewards/margins"], 4),
+        "reward_accuracy_delta": round(post_eval["rewards/accuracies"] - pre_eval["rewards/accuracies"], 4),
+        "step_telemetry": step_history, "eval_telemetry": eval_history,
+        "final_vram": query_dual_gpu_vram(), "model_meta": load_meta,
+    }
     metrics_path = output_dir / "dpo_metrics.json"
-    metrics_path.write_text(
-        json.dumps(
-            {
-                "tier": args.tier,
-                "elapsed_sec": round(time.time() - t0, 2),
-                "beta": args.beta,
-                "ref_mode": args.ref_mode,
-                "sft_adapter_dir": str(sft_adapter_dir),
-                "final_adapter_dir": str(final_adapter_dir),
-                "max_steps": total_steps,
-                "gradient_accumulation_steps": args.gradient_accumulation_steps,
-                "learning_rate": args.learning_rate,
-                "pre_dpo_eval": pre_eval,
-                "post_dpo_eval": post_eval,
-                "eval_loss_delta": round(post_eval["eval_loss"] - pre_eval["eval_loss"], 4),
-                "reward_margin_delta": round(post_eval["rewards/margins"] - pre_eval["rewards/margins"], 4),
-                "reward_accuracy_delta": round(post_eval["rewards/accuracies"] - pre_eval["rewards/accuracies"], 4),
-                "step_telemetry": step_history,
-                "eval_telemetry": eval_history,
-                "final_vram": query_dual_gpu_vram(),
-                "model_meta": load_meta,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    metrics_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     console.print(f"[bold green]Saved DPO LoRA adapter:[/bold green] {final_adapter_dir} | [bold green]Metrics:[/bold green] {metrics_path}")
     return 0
 

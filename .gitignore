@@ -20,6 +20,7 @@ __pycache__/
 data/raw/
 data/processed/
 data/cache/
+data/oss_repos/
 checkpoints/
 runs/
 outputs/

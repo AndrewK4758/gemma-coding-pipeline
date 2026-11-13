@@ -105,7 +105,7 @@ class ParquetSftDataset(Dataset):
 
 @dataclass
 class SftCodingDataCollator:
-    """Dynamic batch collator that right-pads sequences to a multiple of 8 for Blackwell Tensor Core MMA alignment."""
+    """Dynamic batch collator that right-pads sequences to a multiple of 8 for Tensor Core MMA alignment."""
 
     pad_token_id: int
     pad_to_multiple_of: int = 8
@@ -202,9 +202,12 @@ class DualGpuTelemetryCallback(TrainerCallback):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Phase 3 Dual-GPU bfloat16 LoRA SFT Trainer.")
+    parser = argparse.ArgumentParser(description="Phase 3 Dual-GPU bfloat16/4-bit LoRA SFT Trainer.")
     parser.add_argument("--tier", choices=("smoke", "dev", "full"), default="smoke", help="Dataset scale tier.")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="Base Hugging Face model checkpoint.")
+    parser.add_argument("--data-dir", default=None, help="Processed Parquet directory (defaults to data/processed/<tier>).")
+    parser.add_argument("--adapter-name", default=None, help="Optional domain adapter suffix (e.g., dotnet, react).")
+    parser.add_argument("--load-in-4bit", action="store_true", help="Enable 4-bit NF4 QLoRA loading (for 26B-A4B MoE).")
     parser.add_argument("--max-seq-length", type=int, default=4096, help="Maximum context sequence length.")
     parser.add_argument("--max-steps", type=int, default=15, help="Max optimizer steps (-1 for full epochs).")
     parser.add_argument("--num-train-epochs", type=float, default=1.0, help="Number of training epochs when max-steps=-1.")
@@ -225,22 +228,24 @@ def main() -> int:
     console = Console()
     t0 = time.time()
 
-    output_dir = Path(args.output_dir) if args.output_dir else (REPO_ROOT / "checkpoints" / f"sft-{args.tier}")
-    logging_dir = Path(args.logging_dir) if args.logging_dir else (REPO_ROOT / "runs" / f"sft-{args.tier}")
+    suffix = f"{args.tier}-{args.adapter_name}" if args.adapter_name else args.tier
+    output_dir = Path(args.output_dir) if args.output_dir else (REPO_ROOT / "checkpoints" / f"sft-{suffix}")
+    logging_dir = Path(args.logging_dir) if args.logging_dir else (REPO_ROOT / "runs" / f"sft-{suffix}")
     output_dir.mkdir(parents=True, exist_ok=True)
     logging_dir.mkdir(parents=True, exist_ok=True)
     os.environ["TENSORBOARD_LOGGING_DIR"] = str(logging_dir)
 
-    console.rule(f"[bold cyan]Phase 3 Dual-GPU bfloat16 LoRA SFT — Tier: {args.tier.upper()} ({args.model_id})")
+    console.rule(f"[bold cyan]Phase 3 Dual-GPU LoRA SFT — Tier: {args.tier.upper()} ({args.model_id})")
     model, tokenizer, load_meta = load_sharded_lora_model_and_tokenizer(
         model_id=args.model_id,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        load_in_4bit=args.load_in_4bit,
         console=console,
     )
 
-    data_dir = REPO_ROOT / "data" / "processed" / args.tier
+    data_dir = Path(args.data_dir) if args.data_dir else (REPO_ROOT / "data" / "processed" / args.tier)
     train_dataset = ParquetSftDataset(data_dir / "sft_train.parquet", tokenizer, max_seq_length=args.max_seq_length)
     eval_dataset = ParquetSftDataset(data_dir / "sft_eval.parquet", tokenizer, max_seq_length=args.max_seq_length)
     collator = SftCodingDataCollator(pad_token_id=int(tokenizer.pad_token_id or 0), pad_to_multiple_of=8)
