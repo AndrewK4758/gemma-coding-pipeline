@@ -32,14 +32,15 @@ import torch
 from peft import PeftModel
 from rich.console import Console
 from rich.table import Table
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel, PreTrainedTokenizerBase
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.build_dataset import SYSTEM_PREAMBLE
+from data.build_dataset import SYSTEM_PREAMBLE, resolve_processed_dir
 from data.compiler_sandbox import verify_code_sample
+from eval.held_out_prompts import HELD_OUT_CODING_SUITE
 from train.dpo_compiler import _encode_padded_tensors, compute_chunked_sequence_logps, load_dpo_split
 from train.model_loader import (
     DEFAULT_MODEL_ID,
@@ -48,25 +49,9 @@ from train.model_loader import (
     query_dual_gpu_vram,
     resolve_checkpoint_id,
 )
+from train.moe_quant import quantize_gemma4_moe_experts_in_place
 
-# 15 Curated Held-Out Coding Prompts (5 TypeScript 6.0.3, 5 Go 1.27, 5 C#/.NET 10 Roslyn)
-HELD_OUT_CODING_SUITE: list[dict[str, str]] = [
-    {"id": "ts_01_lru_ttl", "language": "typescript", "category": "synthesis", "prompt": "Write a self-contained TypeScript generic function `filterDefined<T>(items: ReadonlyArray<T | null | undefined>): T[]` using a type predicate `(x): x is T`. Return only a single ```typescript fenced code block."},
-    {"id": "ts_02_result_map", "language": "typescript", "category": "synthesis", "prompt": "Write a TypeScript discriminated union `type Result<T, E> = { ok: true; value: T } | { ok: false; error: E }` and a generic function `mapResult<T, U, E>(r: Result<T, E>, fn: (v: T) => U): Result<U, E>`. Return only a single ```typescript fenced code block."},
-    {"id": "ts_03_bugfix_reduce", "language": "typescript", "category": "bugfix", "prompt": "Fix the TypeScript type error (`TS2322`) in this function so it returns a valid `Record<string, number>`:\n```typescript\nexport function sumByKey(items: Array<{ key: string; count: number }>): Record<string, number> {\n  return items.reduce((acc, item) => { acc[item.key] = (acc[item.key] ?? 0) + item.count; return acc; }, {} as Record<string, number>);\n}\n```\nReturn only the corrected ```typescript fenced code block."},
-    {"id": "ts_04_retry_backoff", "language": "typescript", "category": "synthesis", "prompt": "Write a TypeScript function `clampScore(value: number, min: number, max: number): number` that throws a `RangeError` if `min > max` and otherwise clamps `value` to `[min, max]`. Return only a single ```typescript fenced code block."},
-    {"id": "ts_05_readonly_tuple", "language": "typescript", "category": "bugfix", "prompt": "Write a TypeScript function `partitionNumbers(nums: readonly number[]): [number[], number[]]` that splits even and odd integers into a 2-tuple. Return only a single ```typescript fenced code block."},
-    {"id": "go_01_worker_sum", "language": "go", "category": "synthesis", "prompt": "Write a complete Go package `sandbox` with a function `SumPositive(nums []int) int` that returns the sum of all strictly positive integers in `nums`. Return only a single ```go fenced code block."},
-    {"id": "go_02_generic_keys", "language": "go", "category": "synthesis", "prompt": "Write a complete Go package `sandbox` with a generic function `MapValues[K comparable, V any](m map[K]V) []V` that collects all values from `m` into a slice. Return only a single ```go fenced code block."},
-    {"id": "go_03_bugfix_slice", "language": "go", "category": "bugfix", "prompt": "Write a complete Go package `sandbox` with a function `DeduplicateInts(in []int) []int` that preserves first-seen order using a `map[int]struct{}`. Return only a single ```go fenced code block."},
-    {"id": "go_04_safe_div", "language": "go", "category": "synthesis", "prompt": "Write a complete Go package `sandbox` importing `errors` with `SafeDivide(a, b float64) (float64, error)` that returns an error when `b == 0`. Return only a single ```go fenced code block."},
-    {"id": "go_05_ring_counter", "language": "go", "category": "synthesis", "prompt": "Write a complete Go package `sandbox` with a struct `BoundedCounter` (`Val int`, `Max int`) and method `(c *BoundedCounter) Inc() int` that increments `Val` up to `Max`. Return only a single ```go fenced code block."},
-    {"id": "cs_01_record_validation", "language": "csharp", "category": "synthesis", "prompt": "Write a C# (.NET 10) `public static class MathUtils` with a method `public static int Clamp(int val, int min, int max)` that returns `val` clamped between `min` and `max`. Return only a single ```csharp fenced code block."},
-    {"id": "cs_02_linq_group", "language": "csharp", "category": "synthesis", "prompt": "Write a C# (.NET 10) `public static class WordCounter` with `public static Dictionary<string, int> CountFrequencies(IEnumerable<string> words)` that counts case-insensitive occurrences. Return only a single ```csharp fenced code block."},
-    {"id": "cs_03_bugfix_nullable", "language": "csharp", "category": "bugfix", "prompt": "Write a C# (.NET 10) `public static class ArrayHelpers` with `public static int SumNonNull(IEnumerable<int?> values)` that sums all non-null elements cleanly under `#nullable enable`. Return only a single ```csharp fenced code block."},
-    {"id": "cs_04_generic_result", "language": "csharp", "category": "synthesis", "prompt": "Write a C# (.NET 10) generic `public readonly record struct Outcome<T>(bool IsSuccess, T? Value, string? Error)` with static factory methods `Ok(T value)` and `Fail(string error)`. Return only a single ```csharp fenced code block."},
-    {"id": "cs_05_span_palindrome", "language": "csharp", "category": "synthesis", "prompt": "Write a C# (.NET 10) `public static class StringChecks` with `public static bool IsPalindrome(string input)` that checks if `input` reads the same forward and backward. Return only a single ```csharp fenced code block."},
-]
+# Held-out coding prompts live in eval/held_out_prompts.py (5 TS, 5 Go, 5 C#, 5 C/C++).
 
 
 def _align_peft_devices(model: PeftModel) -> None:
@@ -81,7 +66,7 @@ def _align_peft_devices(model: PeftModel) -> None:
 
 
 def load_multi_adapter_benchmark_model(
-    model_id: str, sft_adapter_dir: Path, dpo_adapter_dir: Path, console: Console
+    model_id: str, sft_adapter_dir: Path, dpo_adapter_dir: Path, console: Console, load_in_4bit: bool = False
 ) -> tuple[PeftModel, PreTrainedTokenizerBase, dict[str, Any]]:
     """Load base model once across cuda:1 + cuda:0 and attach both 'sft' and 'dpo' LoRA adapters."""
     t0 = time.time()
@@ -90,32 +75,35 @@ def load_multi_adapter_benchmark_model(
     model_type = getattr(cfg, "model_type", "gemma4")
     text_cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
     num_layers = getattr(text_cfg, "num_hidden_layers", 42)
-    device_map = build_asymmetric_device_map(model_type=model_type, num_layers=num_layers)
+    is_moe = bool(getattr(text_cfg, "enable_moe_block", False) or getattr(text_cfg, "num_experts", 0) > 1)
+    split_layer = 21 if num_layers <= 30 else 26
+    device_map = build_asymmetric_device_map(
+        model_type=model_type, num_layers=num_layers, primary_gpu_max_layer=split_layer,
+        offload_multimodal=bool(load_in_4bit or is_moe), offload_experts_to_cpu=bool(load_in_4bit and is_moe),
+    )
     attn_arg = {"text_config": "sdpa", "vision_config": "sdpa", "audio_config": "eager"} if model_type == "gemma4" else "sdpa"
-
     tokenizer = AutoTokenizer.from_pretrained(str(dpo_adapter_dir))
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-
-    base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-        resolved_id, dtype=torch.bfloat16, device_map=device_map, attn_implementation=attn_arg
-    )
+    load_kw: dict[str, Any] = {"dtype": torch.bfloat16, "device_map": device_map, "attn_implementation": attn_arg}
+    if load_in_4bit:
+        load_kw["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16, llm_int8_enable_fp32_cpu_offload=True,
+        )
+    base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(resolved_id, **load_kw)
+    if load_in_4bit and is_moe:
+        quantize_gemma4_moe_experts_in_place(base_model, layer_device_map={i: (1 if i <= split_layer else 0) for i in range(num_layers)})
     install_chunked_causal_lm_loss(base_model, chunk_size=256)
 
-    console.print(f"[bold cyan]Attaching Phase 3 SFT adapter ('sft'):[/bold cyan] {sft_adapter_dir}")
     peft_model = PeftModel.from_pretrained(base_model, str(sft_adapter_dir), adapter_name="sft", is_trainable=False)
-    console.print(f"[bold cyan]Attaching Phase 4 DPO adapter ('dpo'):[/bold cyan] {dpo_adapter_dir}")
     peft_model.load_adapter(str(dpo_adapter_dir), adapter_name="dpo", is_trainable=False)
     _align_peft_devices(peft_model)
     peft_model.eval()
-
     return peft_model, tokenizer, {
-        "resolved_model_id": resolved_id,
-        "model_type": model_type,
-        "sft_adapter_dir": str(sft_adapter_dir),
-        "dpo_adapter_dir": str(dpo_adapter_dir),
-        "single_load_elapsed_sec": round(time.time() - t0, 2),
-        "vram_after_multi_adapter_load": query_dual_gpu_vram(),
+        "resolved_model_id": resolved_id, "model_type": model_type, "load_in_4bit": load_in_4bit,
+        "sft_adapter_dir": str(sft_adapter_dir), "dpo_adapter_dir": str(dpo_adapter_dir),
+        "single_load_elapsed_sec": round(time.time() - t0, 2), "vram_after_multi_adapter_load": query_dual_gpu_vram(),
     }
 
 
@@ -265,19 +253,24 @@ def evaluate_live_compile_pass_at_1(
             "response_preview": resp[:240],
         }
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(20, max(len(HELD_OUT_CODING_SUITE), 1))) as pool:
         graded = list(pool.map(_grade_one, range(len(HELD_OUT_CODING_SUITE))))
 
     passed_total = sum(1 for g in graded if g["passed"])
     per_lang = {
         lang: {
-            "passed": sum(1 for g in graded if g["language"] == lang and g["passed"]),
-            "total": sum(1 for g in graded if g["language"] == lang),
+            "passed": sum(1 for g in graded if (g["language"] in {"c", "cpp"} if lang == "cpp" else g["language"] == lang) and g["passed"]),
+            "total": sum(1 for g in graded if (g["language"] in {"c", "cpp"} if lang == "cpp" else g["language"] == lang)),
             "pass_at_1_pct": round(
-                (sum(1 for g in graded if g["language"] == lang and g["passed"]) / max(sum(1 for g in graded if g["language"] == lang), 1)) * 100.0, 2
+                (
+                    sum(1 for g in graded if (g["language"] in {"c", "cpp"} if lang == "cpp" else g["language"] == lang) and g["passed"])
+                    / max(sum(1 for g in graded if (g["language"] in {"c", "cpp"} if lang == "cpp" else g["language"] == lang)), 1)
+                )
+                * 100.0,
+                2,
             ),
         }
-        for lang in ("typescript", "go", "csharp")
+        for lang in ("typescript", "go", "csharp", "cpp")
     }
     return {
         "total_prompts": len(graded),
@@ -293,25 +286,36 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Phase 5 Multi-Adapter Coding Benchmark.")
     parser.add_argument("--tier", choices=("smoke", "dev", "full"), default="smoke")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--adapter-name", default=None)
+    parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--sft-adapter", default=None)
     parser.add_argument("--dpo-adapter", default=None)
     parser.add_argument("--max-new-tokens", type=int, default=192)
     parser.add_argument("--output-path", default=None)
     args = parser.parse_args()
 
-    console = Console()
-    t0 = time.time()
+    console, t0 = Console(), time.time()
     torch.manual_seed(42)
 
-    sft_dir = Path(args.sft_adapter) if args.sft_adapter else (REPO_ROOT / "checkpoints" / f"sft-{args.tier}" / "final_adapter")
-    dpo_dir = Path(args.dpo_adapter) if args.dpo_adapter else (REPO_ROOT / "checkpoints" / f"dpo-{args.tier}" / "final_adapter")
-    out_path = Path(args.output_path) if args.output_path else (REPO_ROOT / "outputs" / "eval" / "benchmark_scorecard.json")
+    suffix = f"{args.tier}-{args.adapter_name}" if args.adapter_name else args.tier
+    sft_dir = Path(args.sft_adapter) if args.sft_adapter else (REPO_ROOT / "checkpoints" / f"sft-{suffix}" / "final_adapter")
+    dpo_cand = REPO_ROOT / "checkpoints" / f"dpo-{suffix}" / "final_adapter"
+    grpo_cand = REPO_ROOT / "checkpoints" / f"grpo-{suffix}" / "final_adapter"
+    dpo_dir = Path(args.dpo_adapter) if args.dpo_adapter else (grpo_cand if grpo_cand.exists() else dpo_cand)
+    out_path = Path(args.output_path) if args.output_path else (
+        REPO_ROOT / "outputs" / "eval" / (f"benchmark_{args.adapter_name}.json" if args.adapter_name else "benchmark_scorecard.json")
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    console.rule(f"[bold cyan]Phase 5 Coding Benchmark (Base vs. SFT vs. DPO) — Tier: {args.tier.upper()}")
-    model, tokenizer, load_meta = load_multi_adapter_benchmark_model(args.model_id, sft_dir, dpo_dir, console)
+    console.rule(f"[bold cyan]Phase 5 Benchmark (Base vs. SFT vs. DPO/GRPO) — {suffix.upper()}")
+    model, tokenizer, load_meta = load_multi_adapter_benchmark_model(
+        args.model_id, sft_dir, dpo_dir, console, load_in_4bit=args.load_in_4bit
+    )
 
-    data_dir = REPO_ROOT / "data" / "processed" / args.tier
+    data_dir = Path(args.data_dir) if args.data_dir else resolve_processed_dir(args.tier, domain=args.adapter_name or "all")
+    if not (data_dir / "sft_eval.parquet").exists():
+        data_dir = REPO_ROOT / "data" / "processed" / args.tier
     sft_eval_rows = pq.read_table(data_dir / "sft_eval.parquet").to_pylist()
     dpo_eval_samples = load_dpo_split(data_dir / "dpo_eval.parquet", tokenizer, max_seq_length=4096)
 

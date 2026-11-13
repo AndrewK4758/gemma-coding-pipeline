@@ -22,23 +22,15 @@ from typing import Any
 import datasets
 from huggingface_hub import HfFileSystem
 
-TARGET_LANGUAGES = ("typescript", "go", "csharp")
-SOURCES = ("codefeedback_magicoder", "commitpack_diffs", "arch_explanations", "local_projects")
+TARGET_LANGUAGES = ("typescript", "go", "csharp", "cpp")
+SOURCES = ("codefeedback_magicoder", "commitpack_diffs", "arch_explanations", "local_projects", "oss_commits")
 
 FENCE_RE = re.compile(r"```([a-zA-Z0-9_+#-]+)?\s*\n(.*?)```", re.DOTALL)
 LANG_ALIASES: dict[str, str] = {
-    "typescript": "typescript",
-    "ts": "typescript",
-    "tsx": "typescript",
-    "javascript": "typescript",
-    "js": "typescript",
-    "go": "go",
-    "golang": "go",
-    "csharp": "csharp",
-    "cs": "csharp",
-    "c#": "csharp",
-    "c-sharp": "csharp",
-    "dotnet": "csharp",
+    "typescript": "typescript", "ts": "typescript", "tsx": "typescript", "javascript": "typescript", "js": "typescript",
+    "go": "go", "golang": "go",
+    "csharp": "csharp", "cs": "csharp", "c#": "csharp", "c-sharp": "csharp", "dotnet": "csharp",
+    "c": "cpp", "cpp": "cpp", "c++": "cpp", "cc": "cpp", "cxx": "cpp", "hpp": "cpp", "h": "cpp",
 }
 
 
@@ -47,9 +39,9 @@ def _make_id(source: str, language: str, instruction: str, response: str) -> str
     return f"{source}_{language}_{digest}"
 
 
-def extract_fenced_code(text: str) -> str:
+def extract_fenced_code(text: str, allow_diff: bool = False) -> str:
     """Return the largest fenced code block in text, or empty string if none exists."""
-    blocks = [m.group(2).strip() for m in FENCE_RE.finditer(text) if (m.group(1) or "").lower() != "diff"]
+    blocks = [m.group(2).strip() for m in FENCE_RE.finditer(text) if allow_diff or (m.group(1) or "").lower() != "diff"]
     return max(blocks, key=len) if blocks else ""
 
 
@@ -94,8 +86,11 @@ DEFAULT_PROJECTS_ROOT = Path(os.environ.get("LOCAL_PROJECTS_ROOT", str(Path.home
 
 
 def _discover_local_source_files(projects_root: Path = DEFAULT_PROJECTS_ROOT) -> dict[str, list[Path]]:
-    """Collect hand-written TypeScript, Go, and C# files across local projects."""
-    ext_map = {".ts": "typescript", ".tsx": "typescript", ".go": "go", ".cs": "csharp"}
+    """Collect hand-written TypeScript, Go, C#, and C/C++ files across local projects."""
+    ext_map = {
+        ".ts": "typescript", ".tsx": "typescript", ".go": "go", ".cs": "csharp",
+        ".c": "cpp", ".cc": "cpp", ".cpp": "cpp", ".cxx": "cpp",
+    }
     skip_dirs = {"node_modules", "dist", "build", "bin", "obj", ".git", ".nx", ".venv", "vendor", "buf_deps", "llama.cpp", "gemma-coding-pipeline", "worktrees"}
     by_lang: dict[str, list[Path]] = {lang: [] for lang in TARGET_LANGUAGES}
     if not projects_root.exists():
@@ -195,9 +190,9 @@ def stream_codefeedback_magicoder(per_lang_quota: int, local_files: dict[str, li
 
 
 def stream_commitpack_diffs(per_lang_quota: int) -> list[dict[str, Any]]:
-    """Source 2: Stream git commit diffs from bigcode/commitpackft across typescript, go, and c#."""
+    """Source 2: Stream git commit diffs from bigcode/commitpackft across typescript, go, c#, and c++."""
     fs = HfFileSystem()
-    hf_lang_map = {"typescript": "typescript", "go": "go", "csharp": "c#"}
+    hf_lang_map = {"typescript": "typescript", "go": "go", "csharp": "c#", "cpp": "c++"}
     records: list[dict[str, Any]] = []
 
     for lang, hf_dir in hf_lang_map.items():
@@ -353,38 +348,37 @@ def harvest_local_projects(
     return records
 
 
-def ingest_all_sources(target_sft_rows: int) -> list[dict[str, Any]]:
-    """Ingest a balanced pool of records across all 4 sources and 3 target languages."""
-    per_source_lang_quota = max(30, int((target_sft_rows * 1.4) / (len(SOURCES) * len(TARGET_LANGUAGES))) + 5)
-    local_files = _discover_local_source_files()
+def ingest_all_sources(
+    target_sft_rows: int,
+    domain: str = "all",
+    oss_only: bool = False,
+    oss_raw_dir: Path | str = "data/raw",
+    oss_corpus_root: Path | str = os.environ.get("OSS_CORPUS_DIR", str(Path.home() / "corpus" / "oss_repos")),
+) -> list[dict[str, Any]]:
+    """Ingest balanced records across general sources and/or mined .NET & React OSS commits."""
     records: list[dict[str, Any]] = []
-    records.extend(stream_codefeedback_magicoder(per_source_lang_quota, local_files))
-    records.extend(stream_commitpack_diffs(per_source_lang_quota))
-    records.extend(stream_arch_explanations(per_source_lang_quota, local_files))
-    records.extend(harvest_local_projects(per_source_lang_quota, local_files))
+    if not oss_only and domain != "oss":
+        per_source_lang_quota = max(30, int((target_sft_rows * 1.4) / (4 * len(TARGET_LANGUAGES))) + 5)
+        local_files = _discover_local_source_files()
+        general: list[dict[str, Any]] = []
+        general.extend(stream_codefeedback_magicoder(per_source_lang_quota, local_files))
+        general.extend(stream_commitpack_diffs(per_source_lang_quota))
+        general.extend(stream_arch_explanations(per_source_lang_quota, local_files))
+        general.extend(harvest_local_projects(per_source_lang_quota, local_files))
+        lang_gate = {"dotnet": "csharp", "react": "typescript", "go": "go", "cpp": "cpp"}.get(domain)
+        records.extend([r for r in general if not lang_gate or r.get("language") == lang_gate])
+    if domain in {"all", "oss", "dotnet", "react", "go", "cpp"}:
+        from data.mine_oss_repos import load_oss_records
 
-    # Inject a controlled probe set (8 lexical near-duplicates + 8 identifier-renamed semantic duplicates)
-    # so Stage B (MinHash LSH) and Stage C (:11434 nomic-embed-text semantic dedup) are both verified on every run.
-    for idx, rec in enumerate(records[:8]):
-        records.append(
-            {
-                **rec,
-                "id": f"{rec['id']}_lexdup_{idx}",
-                "instruction": rec["instruction"] + " ",
-            }
-        )
-    for idx, rec in enumerate(records[8:16]):
-        # Interleave inline comments between lines so 5-gram shingle Jaccard drops < 0.85 while semantic cosine stays > 0.94
-        tweaked_lines = [
+        records.extend(load_oss_records("sft", raw_dir=oss_raw_dir, corpus_root=oss_corpus_root, domain=domain))
+    # Inject lexical + semantic duplicate probes so Stage B (MinHash) and Stage C (:11434) verify on non-empty runs.
+    probe_head = list(records[:16])
+    for idx, rec in enumerate(probe_head[:8]):
+        records.append({**rec, "id": f"{rec['id']}_lexdup_{idx}", "instruction": rec["instruction"] + " "})
+    for idx, rec in enumerate(probe_head[8:16]):
+        tweaked = [
             f"{ln}  // step-{i}" if (i % 2 == 0 and ln.strip() and not ln.strip().startswith("```")) else ln
             for i, ln in enumerate(rec["response"].splitlines())
         ]
-        records.append(
-            {
-                **rec,
-                "id": f"{rec['id']}_semdup_{idx}",
-                "instruction": rec["instruction"],
-                "response": "\n".join(tweaked_lines),
-            }
-        )
+        records.append({**rec, "id": f"{rec['id']}_semdup_{idx}", "response": "\n".join(tweaked)})
     return records

@@ -16,23 +16,35 @@ import concurrent.futures
 import glob
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from data.cpp_sandbox import check_cpp_snippet, mutate_cpp_snippet
 from data.ingest_sources import FENCE_RE, extract_fenced_code
 
+
 def _resolve_tsc_module_path() -> str:
-    """Resolve a local TypeScript compiler module path from env or standard workspace locations."""
+    """Resolve a local TypeScript compiler module path from env, global npm, or workspace paths."""
+    env_tsc = os.environ.get("TSC_MODULE_PATH", "")
+    if env_tsc and Path(env_tsc).exists():
+        return env_tsc
+    which_tsc = shutil.which("tsc")
+    if which_tsc:
+        pkg = Path(which_tsc).resolve().parent.parent / "lib" / "node_modules" / "typescript"
+        if pkg.exists():
+            return str(pkg)
     candidates = [
-        os.environ.get("TSC_MODULE_PATH", ""),
-        *sorted(glob.glob(str(Path.home() / "projects/*/*/node_modules/typescript"))),
-        *sorted(glob.glob(str(Path.home() / "projects/*/node_modules/typescript"))),
+        str(Path.cwd() / "node_modules" / "typescript"),
         "/usr/lib/node_modules/typescript",
         "/usr/local/lib/node_modules/typescript",
     ]
+    for root_str in filter(None, [os.environ.get("LOCAL_PROJECTS_ROOT", ""), str(Path.home() / "workspace"), str(Path.home() / "projects")]):
+        candidates.extend(sorted(glob.glob(f"{root_str}/*/node_modules/typescript")))
+        candidates.extend(sorted(glob.glob(f"{root_str}/*/*/node_modules/typescript")))
     return next((c for c in candidates if c and Path(c).exists()), "typescript")
 
 
@@ -54,9 +66,18 @@ class SandboxResult:
 
 def _prepare_roslyn_env() -> tuple[str, str] | None:
     """Locate .NET 10 Roslyn csc.dll and generate a shared reference assembly response file."""
-    roots = [r for r in (os.environ.get("DOTNET_ROOT", ""), str(Path.home() / ".asdf/installs/dotnet/*"), str(Path.home() / ".dotnet"), "/usr/share/dotnet") if r]
-    csc_matches = [m for r in roots for m in sorted(glob.glob(f"{r}/sdk/*/Roslyn/bincore/csc.dll"))]
-    ref_matches = [m for r in roots for m in sorted(glob.glob(f"{r}/packs/Microsoft.NETCore.App.Ref/*/ref/net10.0/*.dll"))]
+    roots = [r for r in (os.environ.get("DOTNET_ROOT", ""), str(Path.home() / ".dotnet"), "/usr/share/dotnet") if r]
+    if shutil.which("dotnet"):
+        try:
+            sdk_proc = subprocess.run(["dotnet", "--list-sdks"], capture_output=True, text=True, timeout=5, check=False)
+            for line in sdk_proc.stdout.splitlines():
+                m = re.search(r"\[([^\]]+)\]", line)
+                if m:
+                    roots.insert(0, str(Path(m.group(1)).parent))
+        except OSError:
+            pass
+    csc_matches = [m for r in dict.fromkeys(roots) for m in sorted(glob.glob(f"{r}/sdk/*/Roslyn/bincore/csc.dll"))]
+    ref_matches = [m for r in dict.fromkeys(roots) for m in sorted(glob.glob(f"{r}/packs/Microsoft.NETCore.App.Ref/*/ref/net10.0/*.dll"))]
     if not csc_matches or not ref_matches:
         return None
     rsp_path = Path(tempfile.gettempdir()) / "gemma_pipeline_net10_refs.rsp"
@@ -82,7 +103,7 @@ def _wrap_go_snippet(code: str) -> str:
 def verify_go_code(code: str) -> SandboxResult:
     """Verify Go code using gofmt -e (syntax/AST) and go build (type check)."""
     wrapped = _wrap_go_snippet(code)
-    with tempfile.TemporaryDirectory(prefix="agy_go_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="sandbox_go_") as tmpdir:
         go_file = Path(tmpdir) / "snippet.go"
         go_file.write_text(wrapped, encoding="utf-8")
 
@@ -93,59 +114,24 @@ def verify_go_code(code: str) -> SandboxResult:
             timeout=10,
         )
         if fmt_proc.returncode != 0:
-            return SandboxResult(
-                passed=False,
-                language="go",
-                diagnostics=fmt_proc.stderr.strip()[:500],
-                toolchain="gofmt -e",
-            )
+            return SandboxResult(passed=False, language="go", diagnostics=fmt_proc.stderr.strip()[:500], toolchain="gofmt -e")
 
         # Also run go build in isolated module to catch type mismatches
         (Path(tmpdir) / "go.mod").write_text("module sandbox\n\ngo 1.24\n", encoding="utf-8")
-        build_proc = subprocess.run(
-            ["go", "build", "."],
-            cwd=tmpdir,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
+        build_proc = subprocess.run(["go", "build", "."], cwd=tmpdir, capture_output=True, text=True, timeout=15)
         if build_proc.returncode != 0:
-            err_lines = [
-                ln.strip()
-                for ln in build_proc.stderr.splitlines()
-                if ln.strip() and not ln.startswith("#")
-            ]
-            # Fail on explicit type or syntax errors; allow unresolved external module/symbol refs in partial snippets
-            strict_go_errors = [
-                ln
-                for ln in err_lines
-                if any(
-                    pat in ln
-                    for pat in (
-                        "syntax error:",
-                        "cannot use ",
-                        "invalid operation:",
-                        "too many arguments",
-                        "not enough arguments",
-                        "wrongd type",
-                        "too many return values",
-                    )
-                )
-            ]
+            err_lines = [ln.strip() for ln in build_proc.stderr.splitlines() if ln.strip() and not ln.startswith("#")]
+            strict_pats = ("syntax error:", "cannot use ", "invalid operation:", "too many arguments", "not enough arguments", "wrong type", "too many return values")
+            strict_go_errors = [ln for ln in err_lines if any(pat in ln for pat in strict_pats)]
             if strict_go_errors:
-                return SandboxResult(
-                    passed=False,
-                    language="go",
-                    diagnostics="\n".join(strict_go_errors[:4]),
-                    toolchain="go build",
-                )
+                return SandboxResult(passed=False, language="go", diagnostics="\n".join(strict_go_errors[:4]), toolchain="go build")
 
     return SandboxResult(passed=True, language="go", diagnostics="OK", toolchain="gofmt+go-build")
 
 
 def verify_typescript_code(code: str) -> SandboxResult:
     """Verify TypeScript code using TypeScript 6.0.3 compiler API via Node."""
-    with tempfile.TemporaryDirectory(prefix="agy_ts_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="sandbox_ts_") as tmpdir:
         ts_file = Path(tmpdir) / "snippet.tsx"
         ts_file.write_text(code.strip() + "\n", encoding="utf-8")
 
@@ -221,7 +207,7 @@ def verify_csharp_code(code: str) -> SandboxResult:
     csc_dll, rsp_file = ROSLYN_ENV
     wrapped = _wrap_csharp_snippet(code)
 
-    with tempfile.TemporaryDirectory(prefix="agy_cs_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="sandbox_cs_") as tmpdir:
         cs_file = Path(tmpdir) / "Snippet.cs"
         out_dll = Path(tmpdir) / "Snippet.dll"
         cs_file.write_text(wrapped, encoding="utf-8")
@@ -255,22 +241,44 @@ def verify_csharp_code(code: str) -> SandboxResult:
     return SandboxResult(passed=True, language="csharp", diagnostics="OK", toolchain="dotnet-10-roslyn-csc")
 
 
+def verify_cpp_code(code: str, language: str = "cpp") -> SandboxResult:
+    """Verify C or C++ code using gcc (-std=c17) or g++ (-std=c++20)."""
+    norm = "c" if language.lower().strip() == "c" else "cpp"
+    passed, diag, toolchain = check_cpp_snippet(code, language=norm)
+    return SandboxResult(passed=passed, language=norm, diagnostics=diag, toolchain=toolchain)
+
+
+def _verify_by_lang(code: str, lang: str) -> SandboxResult:
+    if lang == "go":
+        return verify_go_code(code)
+    if lang == "csharp":
+        return verify_csharp_code(code)
+    if lang in {"c", "cpp", "c++", "cc", "cxx"}:
+        return verify_cpp_code(code, language=lang)
+    return verify_typescript_code(code)
+
+
 def verify_code_sample(response_text: str, language: str = "typescript") -> SandboxResult:
     """Extract fenced code from response text (or raw code) and run the language-appropriate compiler verifier."""
     lang = language.lower().strip()
     code = extract_fenced_code(response_text)
     if not code:
         return SandboxResult(passed=False, language=lang, diagnostics="No fenced code block found", toolchain="none")
-    if lang == "go":
-        return verify_go_code(code)
-    if lang == "csharp":
-        return verify_csharp_code(code)
-    return verify_typescript_code(code)
+    return _verify_by_lang(code, lang)
 
 
 def verify_record(record: dict[str, Any]) -> tuple[dict[str, Any], SandboxResult]:
     """Extract fenced code from record and run the language-appropriate compiler verifier."""
     lang = str(record.get("language", "typescript")).lower()
+    if record.get("record_type") == "oss_diff":
+        diff_body = extract_diff_block(str(record.get("response", "")))
+        ok = bool(diff_body)
+        return record, SandboxResult(
+            passed=ok,
+            language=lang,
+            diagnostics="OK (oss_diff)" if ok else "Empty or invalid unified diff",
+            toolchain="oss-git-diff",
+        )
     return record, verify_code_sample(str(record.get("response", "")), lang)
 
 
@@ -281,8 +289,8 @@ def verify_records_parallel(
     """Run 32-thread parallel compiler verification across all candidate records."""
     passed_records: list[dict[str, Any]] = []
     failed_records: list[dict[str, Any]] = []
-    per_lang_pass = {"typescript": 0, "go": 0, "csharp": 0}
-    per_lang_fail = {"typescript": 0, "go": 0, "csharp": 0}
+    per_lang_pass = {"typescript": 0, "go": 0, "csharp": 0, "cpp": 0}
+    per_lang_fail = {"typescript": 0, "go": 0, "csharp": 0, "cpp": 0}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [pool.submit(verify_record, rec) for rec in records]
@@ -328,6 +336,8 @@ def _mutate_code_for_dpo(code: str, language: str, idx: int) -> str:
         if mutation_kind == 0:
             return wrapped + "\nvar __dpoBrokenMetric int = \"type_mismatch_string_literal\"\n"
         return wrapped + "\nfunc __dpoBrokenSyntax(a int) int { return a + }\n"
+    if language in {"c", "cpp"}:
+        return mutate_cpp_snippet(code, idx)
     # csharp
     if mutation_kind == 0:
         if re.search(r"\b(class|struct|interface|record|enum)\s+", code):
@@ -345,13 +355,7 @@ def _build_single_dpo_pair(args: tuple[int, dict[str, Any]]) -> dict[str, Any] |
         return None
     clean_code = match.group(2).strip()
     mutated_code = _mutate_code_for_dpo(clean_code, lang, idx)
-
-    if lang == "go":
-        mut_res = verify_go_code(mutated_code)
-    elif lang == "csharp":
-        mut_res = verify_csharp_code(mutated_code)
-    else:
-        mut_res = verify_typescript_code(mutated_code)
+    mut_res = _verify_by_lang(mutated_code, lang)
 
     if mut_res.passed:
         return None
@@ -385,3 +389,6 @@ def build_dpo_preference_pairs(
         if item is not None and len(pairs) < target_dpo_pairs:
             pairs.append(item)
     return pairs
+
+
+from data.oss_sandbox import extract_diff_block, verify_oss_worktree_patch  # noqa: E402,F401

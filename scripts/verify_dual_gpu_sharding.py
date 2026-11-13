@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify dual-GPU Blackwell environment, 42-layer Gemma-2-9B device_map, and cross-GPU LoRA + 8-bit PagedAdamW."""
+"""Verify dual-GPU CUDA environment, 42-layer device_map, and cross-GPU LoRA + 8-bit PagedAdamW."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 # Keep CUDA context and cuBLAS workspace footprint minimal (<2 MiB) so verification
-# runs cleanly alongside local-ai-offload.service without disturbing loaded models.
+# runs cleanly alongside any local inference server without disturbing loaded models.
 os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -20,14 +20,14 @@ import torch.nn as nn
 from peft import LoraConfig, inject_adapter_in_model
 
 GEMMA2_9B_NUM_LAYERS = 42
-RTX_5080_MAX_LAYER = 26  # Layers 0..26 (27 layers) on cuda:1 (RTX 5080 16GB)
+PRIMARY_GPU_MAX_LAYER = 26  # Layers 0..26 (27 layers) on cuda:1 (16 GB)
 
 
 def build_gemma2_9b_device_map() -> dict[str, int]:
-    """Construct static 42-layer device_map across cuda:1 (RTX 5080) and cuda:0 (RTX 5070 Ti)."""
+    """Construct static 42-layer device_map across cuda:1 (16 GB) and cuda:0 (12 GB)."""
     device_map: dict[str, int] = {"model.embed_tokens": 0}
     for layer_idx in range(GEMMA2_9B_NUM_LAYERS):
-        device_map[f"model.layers.{layer_idx}"] = 1 if layer_idx <= RTX_5080_MAX_LAYER else 0
+        device_map[f"model.layers.{layer_idx}"] = 1 if layer_idx <= PRIMARY_GPU_MAX_LAYER else 0
     device_map["model.norm"] = 0
     device_map["lm_head"] = 0
     return device_map
@@ -68,9 +68,8 @@ def main() -> int:
     print(f"bitsandbytes   : {bnb.__version__}")
     arch_list = torch.cuda.get_arch_list()
     print(f"CUDA Arch List : {arch_list}")
-    assert "sm_120" in arch_list or "compute_120" in arch_list, "PyTorch build is missing sm_120 Blackwell support!"
 
-    print("\n=== 2. Dual-GPU Blackwell Hardware Verification ===")
+    print("\n=== 2. Dual-GPU CUDA Hardware Verification ===")
     device_count = torch.cuda.device_count()
     assert device_count >= 2, f"Expected >=2 GPUs with CUDA_VISIBLE_DEVICES=0,1, found {device_count}"
     for idx in range(device_count):
@@ -84,15 +83,15 @@ def main() -> int:
             f"bf16={bf16_ok} | p2p_to_cuda:{1 - idx}={p2p_other} | "
             f"VRAM free={free_b / (1024**2):.1f} MiB / total={total_b / (1024**2):.1f} MiB"
         )
-        assert cap[0] >= 12, f"Expected Blackwell compute capability >=12.0 on cuda:{idx}, got {cap}"
+        assert cap[0] >= 8, f"Expected Ampere+ compute capability >=8.0 on cuda:{idx}, got {cap}"
         assert bf16_ok, f"bfloat16 not supported on cuda:{idx}"
 
-    print("\n=== 3. Static 42-Layer Device Map for google/gemma-2-9b-it (bfloat16) ===")
+    print("\n=== 3. Static 42-Layer Device Map (bfloat16) ===")
     device_map = build_gemma2_9b_device_map()
     cuda1_keys = [k for k, v in device_map.items() if v == 1]
     cuda0_keys = [k for k, v in device_map.items() if v == 0]
-    print(f"cuda:1 (RTX 5080 16GB)    : {len(cuda1_keys)} modules (model.layers.0 .. model.layers.26)")
-    print(f"cuda:0 (RTX 5070 Ti 12GB) : {len(cuda0_keys)} modules (embed_tokens, model.layers.27 .. 41, norm, lm_head)")
+    print(f"cuda:1 (Primary 16 GB GPU)   : {len(cuda1_keys)} modules (model.layers.0 .. model.layers.26)")
+    print(f"cuda:0 (Secondary 12 GB GPU) : {len(cuda0_keys)} modules (embed_tokens, model.layers.27 .. 41, norm, lm_head)")
     print(json.dumps(device_map, indent=2))
 
     print("\n=== 4. Synthetic 2-Device bfloat16 Cross-GPU Activation + LoRA + PagedAdamW8bit Verification ===")
