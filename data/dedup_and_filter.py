@@ -34,10 +34,16 @@ def passes_heuristic_filter(record: dict[str, Any], max_line_len: int = 500, min
     """Stage A: Drop auto-generated files, minified lines (>500 chars), boilerplate, or empty code blocks."""
     instruction = str(record.get("instruction", "")).strip()
     response = str(record.get("response", "")).strip()
+    if (not instruction or not response) and isinstance(record.get("messages"), list):
+        msgs = record["messages"]
+        instruction = instruction or next((str(m.get("content", "")).strip() for m in msgs if m.get("role") == "user"), "")
+        response = response or next(
+            (str(m.get("content", "")).strip() for m in reversed(msgs) if m.get("role") in ("assistant", "model")), ""
+        )
     if len(instruction) < 15 or len(response) < 35:
         return False
 
-    code = extract_fenced_code(response)
+    code = extract_fenced_code(response, allow_diff=(record.get("record_type") == "oss_diff"))
     if not code:
         return False
 
@@ -101,7 +107,7 @@ def _fetch_embeddings_batch(
     endpoint: str = "http://127.0.0.1:11434/v1/embeddings",
     model: str = "embedding",
 ) -> list[list[float]]:
-    """Call local CPU nomic-embed-text endpoint on :11434 (0 MB GPU VRAM on Ryzen 9 9955HX3D)."""
+    """Call local CPU embedding endpoint on :11434 (0 MB GPU VRAM)."""
     payload = json.dumps({"model": model, "input": texts}).encode("utf-8")
     req = urllib.request.Request(
         endpoint,
@@ -128,7 +134,7 @@ def deduplicate_semantic_embeddings(
     embed_inputs: list[str] = []
     for rec in records:
         cleaned_resp = STEP_COMMENT_RE.sub("", rec["response"])
-        code = extract_fenced_code(cleaned_resp) or cleaned_resp
+        code = extract_fenced_code(cleaned_resp, allow_diff=(rec.get("record_type") == "oss_diff")) or cleaned_resp
         snippet = f"Language: {rec['language']}\nTask: {rec['instruction'][:500]}\nCode:\n{code[:1100]}"
         embed_inputs.append(snippet)
 

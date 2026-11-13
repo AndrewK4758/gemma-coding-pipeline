@@ -42,7 +42,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from data.build_dataset import SYSTEM_PREAMBLE
-from data.compiler_sandbox import SandboxResult, verify_code_sample
+from data.compiler_sandbox import SandboxResult, extract_diff_block, verify_code_sample, verify_oss_worktree_patch
 from data.ingest_sources import extract_fenced_code
 from train.dpo_compiler import _encode_padded_tensors, compute_chunked_sequence_logps
 from train.model_loader import (
@@ -52,8 +52,40 @@ from train.model_loader import (
 )
 
 
-def grade_completion_rubric(completion_text: str, language: str) -> dict[str, Any]:
-    """Deterministic RLVR compiler reward rubric (+1.0 fenced block, +2.0 compiles, +0.5 clean, -1.0 fail)."""
+def grade_completion_rubric(
+    completion_text: str, language: str, task: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Deterministic RLVR reward rubric supporting snippet compilation and live OSS worktree tests."""
+    if task and task.get("record_type") == "oss_worktree" and task.get("repo_path") and task.get("parent_sha"):
+        diff_body = extract_diff_block(completion_text)
+        if not diff_body:
+            return {
+                "reward": -1.0, "code_extracted": False, "compiler_passed": False,
+                "toolchain": "oss-worktree", "diagnostics": "Missing valid unified diff",
+            }
+        lowered = completion_text.lower()
+        if "rest of implementation" in lowered or "... existing code" in lowered:
+            return {
+                "reward": -1.0, "code_extracted": True, "compiler_passed": False,
+                "toolchain": "oss-worktree", "diagnostics": "Rejected truncated placeholder diff",
+            }
+        eco = str(task.get("ecosystem", "react"))
+        passed, diag = verify_oss_worktree_patch(
+            repo_path=str(task["repo_path"]),
+            parent_sha=str(task["parent_sha"]),
+            diff_text=completion_text,
+            ecosystem=eco,
+            test_files=list(task.get("test_files") or []),
+        )
+        reward = 3.5 if passed else (-0.5 if "git apply failed" in diag else 0.25)
+        return {
+            "reward": round(float(reward), 4),
+            "code_extracted": True,
+            "compiler_passed": passed,
+            "toolchain": f"oss-{eco}",
+            "diagnostics": diag[:200],
+        }
+
     code = extract_fenced_code(completion_text)
     if not code:
         return {"reward": -1.0, "code_extracted": False, "compiler_passed": False, "toolchain": "none", "diagnostics": "Missing fenced code"}
@@ -128,6 +160,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Phase 4B Dual-GPU Online GRPO Trainer with Compiler Sandbox.")
     parser.add_argument("--tier", choices=("smoke", "dev", "full"), default="smoke")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--adapter-name", default=None)
+    parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--adapter-path", default=None)
     parser.add_argument("--max-steps", type=int, default=2)
     parser.add_argument("--num-generations", type=int, default=4)
@@ -149,24 +184,31 @@ def main() -> int:
     t0 = time.time()
     torch.manual_seed(42)
 
-    dpo_cand = REPO_ROOT / "checkpoints" / f"dpo-{args.tier}" / "final_adapter"
-    sft_cand = REPO_ROOT / "checkpoints" / f"sft-{args.tier}" / "final_adapter"
+    suffix = f"{args.tier}-{args.adapter_name}" if args.adapter_name else args.tier
+    dpo_cand = REPO_ROOT / "checkpoints" / f"dpo-{suffix}" / "final_adapter"
+    sft_cand = REPO_ROOT / "checkpoints" / f"sft-{suffix}" / "final_adapter"
     adapter_dir = Path(args.adapter_path) if args.adapter_path else (dpo_cand if dpo_cand.exists() else sft_cand)
     if not adapter_dir.exists():
         raise FileNotFoundError(f"Initial adapter checkpoint not found at {adapter_dir}")
 
-    output_dir = Path(args.output_dir) if args.output_dir else (REPO_ROOT / "checkpoints" / f"grpo-{args.tier}")
-    logging_dir = Path(args.logging_dir) if args.logging_dir else (REPO_ROOT / "runs" / f"grpo-{args.tier}")
+    output_dir = Path(args.output_dir) if args.output_dir else (REPO_ROOT / "checkpoints" / f"grpo-{suffix}")
+    logging_dir = Path(args.logging_dir) if args.logging_dir else (REPO_ROOT / "runs" / f"grpo-{suffix}")
     output_dir.mkdir(parents=True, exist_ok=True)
     logging_dir.mkdir(parents=True, exist_ok=True)
 
-    console.rule(f"[bold cyan]Phase 4B Online GRPO Trainer — Tier: {args.tier.upper()} (G={args.num_generations}, kl_beta={args.kl_beta})")
+    console.rule(f"[bold cyan]Phase 4B Online GRPO — Tier: {args.tier.upper()} (G={args.num_generations}, kl={args.kl_beta})")
     model, tokenizer, load_meta = load_sharded_lora_model_and_tokenizer(
-        model_id=args.model_id, adapter_path=adapter_dir, console=console
+        model_id=args.model_id, adapter_path=adapter_dir, load_in_4bit=args.load_in_4bit, console=console
     )
 
-    raw_rows = pq.read_table(REPO_ROOT / "data" / "processed" / args.tier / "dpo_train.parquet").to_pylist()
-    prompt_pool = sorted(raw_rows, key=lambda r: len(r["chosen"]))
+    data_dir = Path(args.data_dir) if args.data_dir else (REPO_ROOT / "data" / "processed" / args.tier)
+    grpo_parquet = data_dir / "grpo_tasks.parquet"
+    grpo_rows = pq.read_table(grpo_parquet).to_pylist() if grpo_parquet.exists() else []
+    if grpo_rows:
+        prompt_pool = grpo_rows
+    else:
+        raw_rows = pq.read_table(data_dir / "dpo_train.parquet").to_pylist()
+        prompt_pool = sorted(raw_rows, key=lambda r: len(r["chosen"]))
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = bnb.optim.PagedAdamW8bit(trainable_params, lr=args.learning_rate, weight_decay=0.01)
     tb_writer = SummaryWriter(log_dir=str(logging_dir))
@@ -180,15 +222,17 @@ def main() -> int:
         completions = generate_group_completions(
             model, tokenizer, prompt_text, num_generations=args.num_generations, max_new_tokens=args.max_new_tokens
         )
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_generations) as pool:
-            grades = list(pool.map(lambda c: grade_completion_rubric(c, lang), completions))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.num_generations, 4)) as pool:
+            grades = list(pool.map(lambda c: grade_completion_rubric(c, lang, task=rec), completions))
 
         live_rewards = [float(g["reward"]) for g in grades]
         live_pass_rate = round(sum(1.0 for g in grades if g["compiler_passed"]) / max(len(grades), 1), 4)
         if len(set(live_rewards)) == 1 and args.num_generations >= 2:
-            contrast_comp = str(rec["rejected"]) if grades[0]["compiler_passed"] else str(rec["chosen"])
+            pos_ref = rec.get("chosen") or f"```diff\n{rec.get('reference_diff', '')}\n```"
+            neg_ref = rec.get("rejected") or "// ... rest of implementation remains the same"
+            contrast_comp = str(neg_ref) if grades[0]["compiler_passed"] else str(pos_ref)
             completions[-1] = contrast_comp
-            grades[-1] = grade_completion_rubric(contrast_comp, lang)
+            grades[-1] = grade_completion_rubric(contrast_comp, lang, task=rec)
 
         rewards = [float(g["reward"]) for g in grades]
         mean_r, std_r = statistics.mean(rewards), statistics.pstdev(rewards)

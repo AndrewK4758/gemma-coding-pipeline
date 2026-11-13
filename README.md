@@ -1,23 +1,23 @@
-# Gemma 4 E4B (`8.0B`) Dual-GPU Coding Fine-Tuning & RLVR Pipeline
+# Gemma 4 (`E4B` & `26B-A4B MoE`) Dual-GPU Coding & Multi-Language OSS Fine-Tuning Pipeline
 
-End-to-end local data curation, compiler verification, **16-bit `bfloat16` Dual-GPU LoRA Supervised Fine-Tuning (SFT)**, **Compiler-Verified Direct Preference Optimization (DPO)**, **Online Group Relative Policy Optimization (GRPO)**, and **`llama.cpp` GGUF (`Q8_0` + `imatrix Q4_K_M`) export** pipeline for **TypeScript/Node**, **Go**, and **C# / .NET 10**.
+End-to-end local data curation, OSS commit mining, git-worktree & compiler verification, **Dual-GPU `bfloat16` / 4-bit NF4 QLoRA SFT**, **Compiler-Verified DPO**, **Online GRPO**, and multi-engine export for **`llama.cpp` (`Q8_0`, `imatrix Q4_K_M`, standalone `--lora` GGUF)**, **Ollama (`Modelfile`)**, and **vLLM (`serve_vllm.sh`)** across **C# / .NET 10**, **React / TypeScript**, **Go**, and **C / C++**.
 
 ---
 
 ## 1. Hardware Topology & Architecture Design
 
-Designed for an asymmetric Dual-GPU Blackwell Linux workstation:
+Designed for an asymmetric Dual-GPU CUDA Linux workstation (`16 GB` + `12 GB` VRAM):
 
-| Component | Detected Spec | Pipeline Role |
+| Component | Target Profile | Pipeline Role |
 | :--- | :--- | :--- |
-| **CPU & L3 Cache** | **AMD Ryzen 9 9955HX3D** (`16C/32T`, `128 MB` 3D V-Cache) | Runs 32-thread compiler sandboxes (`tsc 6.0.3`, `go 1.27.1`, `.NET 10.0.400 Roslyn`), `MinHash LSH`, and `:11434` `nomic-embed-text` semantic deduplication (`0 MB` GPU VRAM). |
-| **External eGPU (`cuda:1`)** | **NVIDIA GeForce RTX 5080** (`16 GB` GDDR7, `400W`, Blackwell `sm_120`, TB5 PCIe Gen3×4) | Holds `model.language_model.layers.0..26` (`27` layers), `embed_tokens_per_layer` (`5.25 GiB` PLE table), and frozen multimodal towers (`~11.0 GiB` weights, `~12.6–13.0 GiB` peak training VRAM). |
-| **Internal dGPU (`cuda:0`)** | **NVIDIA GeForce RTX 5070 Ti Laptop** (`12 GB` GDDR7, `140W`, Blackwell `sm_120`, PCIe Gen5×8) | Holds `embed_tokens`, `model.language_model.layers.27..41` (`15` layers), `norm`, and tied `lm_head` (`~3.9 GiB` weights, `~5.1–5.3 GiB` peak training VRAM). |
-| **System RAM & NVMe** | **30 GiB DDR5 + 95 GiB Swap; 1.4+ TB Free NVMe** | Hosts Arrow/Parquet datasets, `PagedAdamW8bit` overflow pages, `bfloat16` LoRA weight folding, and GGUF quantization. |
+| **Host CPU** | **Multi-Core x86_64 CPU** (`16C/32T`) | Runs 32-thread compiler sandboxes (`tsc`, `go`, `.NET 10 Roslyn`, `gcc`/`g++`), `MinHash LSH`, and optional local `:11434` semantic deduplication (`0 MB` GPU VRAM). |
+| **Primary GPU (`cuda:1`)** | **16 GB CUDA GPU** | Holds `model.language_model.layers.0..26` (`27` layers), `embed_tokens_per_layer` (`5.25 GiB` PLE table), and frozen multimodal towers (`~11.0 GiB` weights, `~12.6–13.0 GiB` peak training VRAM). |
+| **Secondary GPU (`cuda:0`)** | **12 GB CUDA GPU** | Holds `embed_tokens`, `model.language_model.layers.27..41` (`15` layers), `norm`, and tied `lm_head` (`~3.9 GiB` weights, `~5.1–5.3 GiB` peak training VRAM). |
+| **System RAM & Storage** | **>= 32 GiB RAM + Swap / Fast NVMe** | Hosts Arrow/Parquet datasets, `PagedAdamW8bit` overflow pages, streaming `bfloat16` LoRA shard merging, and GGUF quantization. |
 
 ### Key Systems Optimizations
-1. **Static Asymmetric Layer Sharding Over Thunderbolt (`p2p_to_cuda=False`)**:
-   Instead of `DDP` or `FSDP`/`ZeRO-3` (which choke the PCIe Gen3×4 Thunderbolt link with multi-gigabyte weight collectives), layers are partitioned statically across `cuda:1` (`Layers 0..26`) and `cuda:0` (`Layers 27..41`). Only a single `~8 MB` hidden-state activation tensor crosses the PCIe boundary per micro-step.
+1. **Static Asymmetric Layer Sharding Over Slow/Asymmetric PCIe (`p2p_to_cuda=False`)**:
+   Instead of `DDP` or `FSDP`/`ZeRO-3` (which choke asymmetric PCIe links with multi-gigabyte weight collectives), layers are partitioned statically across `cuda:1` (`Layers 0..26`) and `cuda:0` (`Layers 27..41`). Only a single `~8 MB` hidden-state activation tensor crosses the PCIe boundary per micro-step.
 2. **256-Token Chunked Vocabulary Cross-Entropy (`262,144` Vocab)**:
    Materializing full-sequence `float32` logits (`[1, 4096, 262144]`) for Gemma 4's `262K` vocabulary would consume `8.58 GiB` on `cuda:0` alone. [`train/model_loader.py`](train/model_loader.py) filters down to unmasked completion tokens (`labels != -100`) and evaluates `lm_head` + `30.0 * tanh(logits / 30.0)` + cross-entropy in **256-token rematerialized chunks**, cutting `cuda:0` activation VRAM by `>6 GiB` with zero mathematical approximation.
 3. **Zero-VRAM Reference Policy Caching in DPO**:
@@ -27,7 +27,7 @@ Designed for an asymmetric Dual-GPU Blackwell Linux workstation:
 
 ## 2. Quick Start: Single-Command End-to-End Orchestrator
 
-[`run_pipeline.py`](run_pipeline.py) sequences data ingestion/filtering (while keeping `local-ai-offload.service` on `:11434` active for CPU embeddings), switches GPUs to `train` mode (`26.2 GiB` usable VRAM), runs training, evaluation, and GGUF export, and guarantees `local-ai-offload.service` is restored via a `try...finally` guard:
+[`run_pipeline.py`](run_pipeline.py) sequences data ingestion/filtering (optionally keeping any `$LOCAL_OFFLOAD_SERVICE` endpoint on `:11434` active for CPU embeddings), switches GPUs to `train` mode (`26.2 GiB` usable VRAM), runs training, evaluation, and GGUF export, and guarantees optional `$LOCAL_OFFLOAD_SERVICE` restoration via a `try...finally` guard:
 
 ```bash
 cd gemma-coding-pipeline
@@ -40,6 +40,16 @@ cd gemma-coding-pipeline
 
 # 3. Full Production Tier (30,000 SFT rows / 10,000 DPO pairs + Online GRPO — overnight)
 .venv/bin/python run_pipeline.py --tier full --stages data,sft,dpo,grpo,eval,export
+
+# 4. Clone MIT/Apache-2.0/BSD-3 .NET, React UI, Go & C/C++ OSS corpus + train modular domain LoRAs
+./scripts/clone_oss_corpus.zsh --only all
+.venv/bin/python run_pipeline.py --tier dev --domain dotnet --adapter-name dotnet --oss-only --stages data,sft,dpo,grpo,eval,export
+.venv/bin/python run_pipeline.py --tier dev --domain react  --adapter-name react  --oss-only --stages data,sft,dpo,grpo,eval,export
+.venv/bin/python run_pipeline.py --tier dev --domain go     --adapter-name go     --oss-only --stages data,sft,dpo,grpo,eval,export
+.venv/bin/python run_pipeline.py --tier dev --domain cpp    --adapter-name cpp    --oss-only --stages data,sft,dpo,grpo,eval,export
+
+# 5. Optional 26B-A4B MoE QLoRA run (auto-enables 4-bit NF4 experts + streaming CPU merge)
+.venv/bin/python run_pipeline.py --tier dev --model-id google/gemma-4-26B-A4B-it --load-in-4bit --domain all --stages data,sft,dpo,eval,export
 ```
 
 Monitor training curves in real time with local TensorBoard:
@@ -51,9 +61,9 @@ Monitor training curves in real time with local TensorBoard:
 
 ## 3. Step-by-Step Manual Workflow
 
-### Step 1 — Data Acquisition, Deduplication & Compiler Verification (`llama-swap` ON)
+### Step 1 — Data Acquisition, Deduplication & Compiler Verification (Local Embeddings `:11434`)
 
-Keep `local-ai-offload.service` running (`./scripts/gpu-mode.zsh status`) so [`data/dedup_and_filter.py`](data/dedup_and_filter.py) can query your local `nomic-embed-text` CPU embedding endpoint (`http://127.0.0.1:11434/v1/embeddings`).
+If running a local OpenAI-compatible embedding service (`./scripts/gpu-mode.zsh status`), [`data/dedup_and_filter.py`](data/dedup_and_filter.py) queries `http://127.0.0.1:11434/v1/embeddings` (`nomic-embed-text` / `embedding`) for semantic deduplication.
 
 ```bash
 .venv/bin/python data/build_dataset.py --tier dev
@@ -64,7 +74,7 @@ Keep `local-ai-offload.service` running (`./scripts/gpu-mode.zsh status`) so [`d
    - **`codefeedback_magicoder`**: `m-a-p/CodeFeedback-Filtered-Instruction` + `ise-uiuc/Magicoder-Evol-Instruct-110K` (`streaming=True`).
    - **`commitpack_diffs`**: `bigcode/commitpackft` real Git commit diffs and instructions (`typescript`, `go`, `c#`).
    - **`arch_explanations`**: `HuggingFaceTB/cosmopedia-v2` + architectural Q&A.
-   - **`local_projects`**: Harvests TypeScript, Go, and C#/.NET 10 modules and tests from `~/projects` (or `$LOCAL_PROJECTS_ROOT`).
+   - **`local_projects`**: Harvests TypeScript, Go, C#, and C/C++ modules and tests from `$LOCAL_PROJECTS_ROOT` (default `~/projects`).
 2. **3-Stage Deduplication Funnel** ([`data/dedup_and_filter.py`](data/dedup_and_filter.py)):
    - **Stage A (Heuristic Filter)**: Strips auto-generated headers, minified lines (`>500` chars), and empty/trivial snippets.
    - **Stage B (Lexical `MinHash LSH`)**: 5-gram shingling (`num_perm=128`, `threshold=0.85`) removes near-identical code in $O(N)$ time.
@@ -77,7 +87,7 @@ Keep `local-ai-offload.service` running (`./scripts/gpu-mode.zsh status`) so [`d
    - Passing snippets populate `sft_train.parquet` / `sft_eval.parquet` (with `-100` prompt completion masking) and serve as `chosen` ($y_w$) in `dpo_train.parquet` / `dpo_eval.parquet`, paired against compiler-verified failing mutations (`rejected` $y_l$) with verbatim compiler diagnostics.
 
 #### How to Add Custom Data Sources
-- **Add another local repository**: Place the repository under `~/projects` (or set `LOCAL_PROJECTS_ROOT=/path/to/repos`) so [`data/ingest_sources.py`](data/ingest_sources.py) discovers its `.ts`, `.go`, and `.cs` files automatically.
+- **Add another local repository**: Place the repository under `$LOCAL_PROJECTS_ROOT` (or `~/workspace`) so [`data/ingest_sources.py`](data/ingest_sources.py) discovers its `.ts`, `.go`, `.cs`, `.c`, and `.cpp` files automatically.
 - **Add a new Hugging Face dataset or local JSONL file**: Add a generator function in [`data/ingest_sources.py`](data/ingest_sources.py) yielding:
   ```python
   {
@@ -94,7 +104,7 @@ Beyond Hugging Face Hub, you can feed [`data/ingest_sources.py`](data/ingest_sou
 
 | Source Category | Specific Origin & Access Method | What Signal It Provides |
 | :--- | :--- | :--- |
-| **1. Your Own Local & Private Git Repos** | `git log -p --no-merges` across `~/projects/*` (`$LOCAL_PROJECTS_ROOT`) | Real `(pre-commit file + commit message) -> post-commit code` surgical edit pairs, test-to-implementation pairs (`FooTests.cs <-> Foo.cs`), and Fill-in-the-Middle (`FIM`) spans. |
+| **1. Your Own Local & Private Git Repos** | `git log -p --no-merges` across `$LOCAL_PROJECTS_ROOT/*` | Real `(pre-commit file + commit message) -> post-commit code` surgical edit pairs, test-to-implementation pairs (`FooTests.cs <-> Foo.cs`), and Fill-in-the-Middle (`FIM`) spans. |
 | **2. GitHub CLI (`gh`) / Gitea / GitLab PR & Issue APIs** | `gh pr list --state merged --json title,body,files` & `gh api repos/<owner>/<repo>/pulls/<id>/comments` | Merged pull request descriptions paired with exact code diffs and senior reviewer comments (`requested_changes -> fixed_commit`). |
 | **3. Stack Exchange Official XML Dumps (Archive.org)** | `https://archive.org/download/stackexchange` (`stackoverflow.com-Posts.7z`, `codereview.stackexchange.com.7z`) | Millions of accepted answers (`AcceptedAnswerId`), high-upvote architectural explanations, and code-review refactors filtered by `<typescript>`, `<go>`, and `<c#>`. |
 | **4. Google BigQuery Public Datasets** | `bq query` on `bigquery-public-data.github_repos` & `bigquery-public-data.stackoverflow` (1 TB/month free tier via `gcloud`) | SQL-queryable petabyte-scale GitHub files, commit messages, and Stack Overflow Q&A filtered by license (`Apache-2.0`, `MIT`) and file extension. |
@@ -106,7 +116,7 @@ Beyond Hugging Face Hub, you can feed [`data/ingest_sources.py`](data/ingest_sou
 
 ### Step 2 — Switch GPUs to Training Mode
 
-Before launching GPU training, unload `local-ai-offload.service` to free all `26.2 GiB` across both Blackwell GPUs:
+Before launching GPU training, optionally stop `$LOCAL_OFFLOAD_SERVICE` to free full Dual-GPU VRAM (`~26+ GiB` usable):
 
 ```bash
 ./scripts/gpu-mode.zsh train
@@ -173,20 +183,20 @@ CUDA_VISIBLE_DEVICES=0,1 CUDA_MODULE_LOADING=LAZY \
   --tier dev \
   --adapter-dir checkpoints/dpo-dev/final_adapter
 
-# 3. Restore local-ai-offload.service (:11434)
+# 3. Optionally restore inference service ($LOCAL_OFFLOAD_SERVICE)
 ./scripts/gpu-mode.zsh inference
 ```
 
 ---
 
-### Step 6 — Using Your Trained Model Live in `llamaswap-server` (`:11434`)
+### Step 6 — Using Your Trained Model Live Across `llama.cpp`, Ollama & vLLM
 
-Your exported GGUF models can be symlinked into `~/.ollama/models/symlinks/` (`$LLM_MODELS_DIR`) and registered in `llama-swap.egpu.yaml` and `llama-swap.single.yaml` under two dedicated model IDs:
+Your exported GGUF models can be placed into `$LLM_MODELS_DIR` and registered in `<inference-server-config>.yaml` under two dedicated model IDs:
 
-| `llama-swap` Model ID | Aliases | Backing GGUF File | Precision & Size | Context & GPU |
+| Server Model ID | Aliases | Backing GGUF File | Precision & Size | Context & GPU |
 | :--- | :--- | :--- | :---: | :--- |
-| **`gemma-coder`** | `gemma-4-e4b-coder`, `gemma-4-e4b-coder-q8`, `openai/gemma-coder` | `gemma-4-E4B-coder-Q8_0.gguf` | `Q8_0` (`7.48 GiB`) | `32K` ctx on RTX 5080 (`75.6 tok/s`) |
-| **`gemma-coder-q4`** | `gemma-4-e4b-coder-q4`, `gemma-4-e4b-coder-imatrix`, `openai/gemma-coder-q4` | `gemma-4-E4B-coder-Q4_K_M-imatrix.gguf` | `Q4_K_M + imatrix` (`4.97 GiB`) | `64K` ctx on RTX 5080 (`90.8 tok/s`) |
+| **`gemma-coder`** | `gemma-4-e4b-coder`, `gemma-4-e4b-coder-q8` | `gemma-4-E4B-coder-Q8_0.gguf` | `Q8_0` (`7.48 GiB`) | `32K` ctx (`cuda:1` `16 GB` GPU, `75.6 tok/s`) |
+| **`gemma-coder-q4`** | `gemma-4-e4b-coder-q4`, `gemma-4-e4b-coder-imatrix` | `gemma-4-E4B-coder-Q4_K_M-imatrix.gguf` | `Q4_K_M + imatrix` (`4.97 GiB`) | `64K` ctx (`cuda:1` `16 GB` GPU, `90.8 tok/s`) |
 
 #### 1. Query It Directly via OpenAI-Compatible API (`curl` / Python / IDE)
 ```bash
@@ -202,19 +212,19 @@ curl -s http://127.0.0.1:11434/v1/chat/completions \
   }' | jq -r '.choices[0].message.content'
 ```
 
-#### 2. Two Ways to Serve New LoRA Trainings in `llama-swap`
+#### 2. Two Ways to Serve New LoRA Trainings
 1. **Merged GGUF Replacement (Zero Runtime Overhead — Default)**:
-   Whenever you run `export/merge_and_quantize_gguf.py` (or `run_pipeline.py --stages export`), it overwrites `outputs/gguf/gemma-4-E4B-coder-Q8_0.gguf` and `gemma-4-E4B-coder-Q4_K_M-imatrix.gguf`. Because `~/.ollama/models/symlinks/gemma-4-E4B-coder-*.gguf` points directly to those files, the very next request to `"model": "gemma-coder"` on `:11434` loads your newly trained model automatically.
+   Whenever you run `export/merge_and_quantize_gguf.py` (or `run_pipeline.py --stages export`), it overwrites `outputs/gguf/gemma-4-E4B-coder-Q8_0.gguf` and `gemma-4-E4B-coder-Q4_K_M-imatrix.gguf`, and also emits a standalone Ollama `Modelfile` and `serve_vllm.sh`. If `$LLM_MODELS_DIR/gemma-4-E4B-coder-*.gguf` symlinks to those outputs, the next server reload uses your newly trained model automatically.
 2. **Dynamic Unmerged `--lora` Adapter Hot-Loading (For Multiple Per-Project LoRAs)**:
-   If you train multiple `134 MB` project-specific adapters (e.g., `checkpoints/dpo-custom/final_adapter`), you can convert the PEFT adapter directly to a standalone GGUF LoRA file without merging the 15 GB base model:
+   If you train multiple `134 MB` project-specific adapters (e.g., `checkpoints/dpo-custom/final_adapter`), you can convert the PEFT adapter directly to a standalone GGUF LoRA file without merging the base model:
    ```bash
-   .venv/bin/python ~/projects/llama.cpp/convert_lora_to_gguf.py \
+   .venv/bin/python "${LLAMA_CPP_DIR:-$HOME/llama.cpp}/convert_lora_to_gguf.py" \
      --base ./outputs/merged-bf16 \
      --outtype f16 \
-     --outfile ~/.ollama/models/symlinks/lora-custom.gguf \
+     --outfile "${LLM_MODELS_DIR:-./outputs/gguf}/lora-custom.gguf" \
      checkpoints/dpo-smoke/final_adapter
    ```
-   Then pass `--lora ${models}/lora-custom.gguf` (or `--lora-scaled ${models}/lora-custom.gguf 1.0`) in the `llama-server` command inside `llama-swap.egpu.yaml`.
+   Then pass `--lora ${models}/lora-custom.gguf` (or `--lora-scaled ${models}/lora-custom.gguf 1.0`) in your `llama-server` command or `<inference-server-config>.yaml`.
 
 ---
 
@@ -241,17 +251,20 @@ curl -s http://127.0.0.1:11434/v1/chat/completions \
 
 | Path | Description |
 | :--- | :--- |
-| [`.tool-versions`](.tool-versions) & [`pyproject.toml`](pyproject.toml) | Pins `asdf` `python 3.13.17` and Blackwell `sm_120` PyTorch (`torch==2.14.1+cu130`), `transformers`, `peft`, `trl`, `bitsandbytes`, `datasets`, `datasketch`, `tensorboard`. |
-| [`scripts/gpu-mode.zsh`](scripts/gpu-mode.zsh) | Switches Dual GPUs between `train` mode (`local-ai-offload` stopped) and `inference` mode (`:11434` active). |
-| [`scripts/verify_dual_gpu_sharding.py`](scripts/verify_dual_gpu_sharding.py) | Phase 1 hardware probe verifying `sm_120`, asymmetric `device_map`, cross-PCIe autograd, and `PagedAdamW8bit`. |
-| [`data/ingest_sources.py`](data/ingest_sources.py) | Streams Hugging Face coding datasets and harvests local `~/projects` TS, Go, and C#/.NET 10 repositories. |
-| [`data/dedup_and_filter.py`](data/dedup_and_filter.py) | Heuristic quality filter + `datasketch` 5-gram `MinHash LSH` + `:11434` `nomic-embed-text` semantic deduplication. |
-| [`data/compiler_sandbox.py`](data/compiler_sandbox.py) | 32-thread compiler verification sandbox (`tsc 6.0.3`, `go 1.27.1`, `.NET 10 Roslyn`) and DPO mutation generator. |
-| [`data/build_dataset.py`](data/build_dataset.py) | Builds tokenized SFT (`-100` prompt masked) and DPO Parquet splits (`data/processed/<tier>/`). |
-| [`train/model_loader.py`](train/model_loader.py) | Static 42-layer Dual-GPU `bfloat16` loader, PEFT LoRA injector, and 256-token chunked vocabulary cross-entropy loss. |
+| [`.tool-versions`](.tool-versions) & [`pyproject.toml`](pyproject.toml) | Pins Python `3.13` and CUDA PyTorch (`torch==2.14.1+cu130`), `transformers`, `peft`, `trl`, `bitsandbytes`, `datasets`, `datasketch`, `tensorboard`. |
+| [`scripts/gpu-mode.zsh`](scripts/gpu-mode.zsh) | Switches Dual GPUs between `train` mode (`$LOCAL_OFFLOAD_SERVICE` stopped) and `inference` / `serve` mode (`:11434` health-checked). |
+| [`scripts/clone_oss_corpus.zsh`](scripts/clone_oss_corpus.zsh) | Shallow-clones curated MIT/Apache-2.0/BSD-3 `.NET`, `React UI`, `Go`, and `C/C++` repositories (`--depth=500`) and warms package caches offline. |
+| [`scripts/verify_dual_gpu_sharding.py`](scripts/verify_dual_gpu_sharding.py) | Phase 1 hardware probe verifying Dual-GPU compute capability, asymmetric `device_map`, cross-PCIe autograd, and `PagedAdamW8bit`. |
+| [`data/mine_oss_repos.py`](data/mine_oss_repos.py) | Mines atomic `impl + test` commits into Gemma 4 `<\|channel>thought` SFT, DPO, and GRPO JSONLs (combined and domain-split). |
+| [`data/ingest_sources.py`](data/ingest_sources.py) | Streams Hugging Face coding datasets, harvests `$LOCAL_PROJECTS_ROOT`, and merges mined `.NET`/`React`/`Go`/`C++` OSS commits. |
+| [`data/dedup_and_filter.py`](data/dedup_and_filter.py) | Heuristic quality filter + `datasketch` 5-gram `MinHash LSH` + `:11434` semantic deduplication. |
+| [`data/compiler_sandbox.py`](data/compiler_sandbox.py), [`data/cpp_sandbox.py`](data/cpp_sandbox.py) & [`data/oss_sandbox.py`](data/oss_sandbox.py) | 32-thread compiler sandbox (`tsc`, `go build`, `.NET 10 Roslyn`, `gcc`/`g++`) plus isolated `/tmp` git-worktree test runner for GRPO rollouts. |
+| [`data/build_dataset.py`](data/build_dataset.py) | Builds tokenized single/multi-turn SFT (`-100` masked), DPO, and `grpo_tasks.parquet` splits (`data/processed/<tier>/`). |
+| [`train/model_loader.py`](train/model_loader.py) & [`train/moe_quant.py`](train/moe_quant.py) | Static asymmetric Dual-GPU `bfloat16`/4-bit QLoRA loader (including 4-bit NF4 MoE `QuantizedGemma4Experts4bit`) + chunked cross-entropy. |
 | [`train/sft_lora.py`](train/sft_lora.py) | Phase 3 Supervised Fine-Tuning trainer with TensorBoard and JSON step telemetry. |
 | [`train/dpo_compiler.py`](train/dpo_compiler.py) | Phase 4A Offline Compiler-Verified DPO trainer with zero-VRAM reference log-prob pre-computation. |
-| [`train/grpo_online.py`](train/grpo_online.py) | Phase 4B Online GRPO trainer with live multi-generation rollouts and compiler sandbox grading. |
-| [`eval/benchmark_coding.py`](eval/benchmark_coding.py) | Phase 5 multi-adapter single-load benchmark (`Base` vs. `SFT` vs. `DPO` perplexity, preference margin, and `Pass@1`). |
-| [`export/merge_and_quantize_gguf.py`](export/merge_and_quantize_gguf.py) | Folds LoRA into `bfloat16`, calibrates coding `imatrix`, exports `Q8_0` and `Q4_K_M` GGUFs, and runs `llama-bench`. |
-| [`run_pipeline.py`](run_pipeline.py) | Top-level end-to-end CLI orchestrator (`--tier smoke|dev|full`). |
+| [`train/grpo_online.py`](train/grpo_online.py) | Phase 4B Online GRPO trainer with snippet compiler and live OSS git-worktree test grading. |
+| [`eval/benchmark_coding.py`](eval/benchmark_coding.py) | Phase 5 multi-adapter single-load benchmark (`Base` vs. `SFT` vs. `DPO`/`GRPO`). |
+| [`export/merge_and_quantize_gguf.py`](export/merge_and_quantize_gguf.py) & [`export/multi_engine.py`](export/multi_engine.py) | Streaming shard-by-shard CPU LoRA merge, `Q8_0`/`Q4_K_M-imatrix` GGUFs, standalone `lora-*.gguf`, Ollama `Modelfile`, and `vLLM` launcher. |
+| [`tests/test_oss_pipeline.py`](tests/test_oss_pipeline.py) & [`tests/test_go_cpp_pipeline.py`](tests/test_go_cpp_pipeline.py) | Automated unit and synthetic-model smoke tests covering `.NET`/`React`/`Go`/`C++` mining, worktree sandboxes, 4-bit MoE, masking, and export. |
+| [`run_pipeline.py`](run_pipeline.py) | Top-level end-to-end CLI orchestrator (`--tier`, `--stages`, `--domain`, `--adapter-name`, `--oss-only`, `--load-in-4bit`). |

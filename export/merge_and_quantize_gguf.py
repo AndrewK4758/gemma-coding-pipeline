@@ -31,25 +31,26 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import pyarrow.parquet as pq
-import torch
 from huggingface_hub import snapshot_download
-from peft import PeftModel
 from rich.console import Console
 from rich.table import Table
-from safetensors import safe_open
-from safetensors.torch import save_file
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from data.build_dataset import resolve_processed_dir
 from data.compiler_sandbox import verify_code_sample
-from train.model_loader import DEFAULT_MODEL_ID, LORA_TARGET_MODULES, resolve_checkpoint_id
-
-LLAMA_CPP_CONVERT_SCRIPT = Path(
-    os.environ.get("LLAMA_CPP_CONVERT_SCRIPT", str(Path.home() / "projects" / "llama.cpp" / "convert_hf_to_gguf.py"))
+from export.multi_engine import (  # noqa: F401
+    export_lora_gguf,
+    merge_lora_weights_into_shards,
+    write_ollama_modelfile,
+    write_vllm_serve_script,
 )
+from train.model_loader import DEFAULT_MODEL_ID, resolve_checkpoint_id
+
+LLAMA_CPP_DIR = Path(os.environ.get("LLAMA_CPP_DIR", str(Path.home() / "llama.cpp")))
+LLAMA_CPP_CONVERT_SCRIPT = Path(os.environ.get("LLAMA_CPP_CONVERT_SCRIPT", str(LLAMA_CPP_DIR / "convert_hf_to_gguf.py")))
 LLAMA_QUANTIZE_BIN = Path("/usr/local/bin/llama-quantize")
 LLAMA_IMATRIX_BIN = Path("/usr/local/bin/llama-imatrix")
 LLAMA_BENCH_BIN = Path("/usr/local/bin/llama-bench")
@@ -57,110 +58,67 @@ LLAMA_COMPLETION_BIN = Path("/usr/local/bin/llama-completion")
 
 
 def _ensure_train_gpu_mode(console: Console) -> None:
-    """Stop local-ai-offload.service if a background hook restarted it during CPU conversion."""
+    """Stop optional external local inference service ($LOCAL_OFFLOAD_SERVICE) before CUDA steps."""
+    svc_name = os.environ.get("LOCAL_OFFLOAD_SERVICE", "").strip()
+    if not svc_name:
+        return
     chk = subprocess.run(
-        ["systemctl", "--user", "is-active", "local-ai-offload.service"],
+        ["systemctl", "--user", "is-active", svc_name],
         capture_output=True,
         text=True,
     )
     if chk.stdout.strip() == "active":
-        console.print("[yellow][GPU-Guard] Stopping local-ai-offload.service before llama.cpp CUDA step...[/yellow]")
-        subprocess.run(["systemctl", "--user", "stop", "local-ai-offload.service"], check=False)
+        console.print(f"[yellow][GPU-Guard] Stopping {svc_name} before llama.cpp CUDA step...[/yellow]")
+        subprocess.run(["systemctl", "--user", "stop", svc_name], check=False)
         time.sleep(2)
 
 
 def merge_lora_to_bf16(
     model_id: str, adapter_dir: Path, merged_dir: Path, console: Console, force: bool = False
-) -> dict[str, Any]:
-    """Load bfloat16 base model + DPO LoRA adapter, run merge_and_unload(), and save to outputs/merged-bf16/."""
-    merged_st_path = merged_dir / "model.safetensors"
-    if not force and merged_st_path.exists() and merged_st_path.stat().st_size > 10_000_000_000:
-        st_size = merged_st_path.stat().st_size
-        console.print(f"[bold green]1/5 Reusing existing merged bfloat16 checkpoint:[/bold green] {merged_st_path} ({st_size / (1024**3):.2f} GiB)")
-        return {
-            "merged_dir": str(merged_dir),
-            "safetensors_path": str(merged_st_path),
-            "safetensors_size_bytes": st_size,
-            "safetensors_size_gib": round(st_size / (1024**3), 3),
-            "total_tensors": 2130,
-            "folded_lora_linear_tensors": 258,
-            "max_abs_weight_delta": 0.015625,
-            "merge_elapsed_sec": 21.4,
-        }
-
-    t0 = time.time()
+) -> tuple[dict[str, Any], Path]:
+    """Stream base shards on CPU and fold LoRA weights into merged bfloat16 safetensors."""
     resolved_id = resolve_checkpoint_id(model_id)
     base_snapshot = Path(snapshot_download(repo_id=resolved_id, local_files_only=True))
+    existing_shards = list(merged_dir.glob("*.safetensors")) if merged_dir.exists() else []
+    total_existing = sum(p.stat().st_size for p in existing_shards)
+    if not force and total_existing > 10_000_000_000:
+        console.print(f"[bold green]1/5 Reusing merged bfloat16 checkpoint:[/bold green] {merged_dir} ({total_existing / (1024**3):.2f} GiB)")
+        return {
+            "merged_dir": str(merged_dir),
+            "safetensors_path": str(existing_shards[0]),
+            "safetensors_size_bytes": total_existing,
+            "safetensors_size_gib": round(total_existing / (1024**3), 3),
+            "shard_count": len(existing_shards),
+            "total_tensors": 0,
+            "folded_lora_linear_tensors": 0,
+            "max_abs_weight_delta": 0.0,
+            "merge_elapsed_sec": 0.0,
+        }, base_snapshot
 
-    console.print(f"[bold cyan]1/5 Loading base model ({resolved_id}) + adapter ({adapter_dir}) for merge_and_unload()...[/bold cyan]")
-    tokenizer = AutoTokenizer.from_pretrained(str(adapter_dir))
-    base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-        resolved_id, dtype=torch.bfloat16, device_map="cpu", low_cpu_mem_usage=True
+    console.print(f"[bold cyan]1/5 Streaming shard-by-shard CPU LoRA merge ({resolved_id} + {adapter_dir})...[/bold cyan]")
+    stats = merge_lora_weights_into_shards(base_snapshot, adapter_dir, merged_dir)
+    console.print(
+        f"[bold cyan]    Merged {stats['shard_count']} shard(s), {stats['total_tensors']} tensors "
+        f"({stats['folded_lora_linear_tensors']} LoRA-folded, max_delta={stats['max_abs_weight_delta']})[/bold cyan]"
     )
-    peft_model = PeftModel.from_pretrained(base_model, str(adapter_dir), is_trainable=False)
-
-    console.print("[bold yellow]    Folding LoRA weights: W_merged = W_0 + (alpha/r) * B @ A via merge_and_unload()...[/bold yellow]")
-    merged_model: PreTrainedModel = peft_model.merge_and_unload()
-    merged_sd = merged_model.state_dict()
-
-    merged_dir.mkdir(parents=True, exist_ok=True)
-    for existing in merged_dir.iterdir():
-        if existing.is_file():
-            existing.chmod(0o644)
-    tokenizer.save_pretrained(str(merged_dir))
-    for fname in ("config.json", "generation_config.json", "chat_template.jinja", "processor_config.json", "tokenizer.json", "tokenizer_config.json"):
-        src_file = base_snapshot / fname
-        if src_file.exists():
-            dst_file = merged_dir / fname
-            shutil.copyfile(src_file, dst_file)
-            dst_file.chmod(0o644)
-
-    orig_st_path = base_snapshot / "model.safetensors"
-    out_tensors: dict[str, torch.Tensor] = {}
-    folded_layer_count = 0
-    max_abs_delta = 0.0
-
-    with safe_open(str(orig_st_path), framework="pt", device="cpu") as f_orig:
-        for key in f_orig.keys():
-            orig_t = f_orig.get_tensor(key)
-            if key in merged_sd and any(f".{m}.weight" in key for m in LORA_TARGET_MODULES):
-                new_t = merged_sd[key].detach().to(device="cpu", dtype=orig_t.dtype).contiguous()
-                delta = float((new_t.float() - orig_t.float()).abs().max().item())
-                max_abs_delta = max(max_abs_delta, delta)
-                out_tensors[key] = new_t
-                folded_layer_count += 1
-            else:
-                out_tensors[key] = orig_t
-
-    console.print(f"[bold cyan]    Writing merged bfloat16 checkpoint ({len(out_tensors)} tensors, {folded_layer_count} LoRA-folded) -> {merged_st_path}[/bold cyan]")
-    save_file(out_tensors, str(merged_st_path), metadata={"format": "pt"})
-    del out_tensors, merged_sd, merged_model, peft_model, base_model
-    gc.collect()
-
-    st_size_bytes = merged_st_path.stat().st_size
-    return {
-        "merged_dir": str(merged_dir),
-        "safetensors_path": str(merged_st_path),
-        "safetensors_size_bytes": st_size_bytes,
-        "safetensors_size_gib": round(st_size_bytes / (1024**3), 3),
-        "total_tensors": 2130,
-        "folded_lora_linear_tensors": folded_layer_count,
-        "max_abs_weight_delta": round(max_abs_delta, 6),
-        "merge_elapsed_sec": round(time.time() - t0, 2),
-    }
+    return stats, base_snapshot
 
 
-def build_imatrix_calibration_file(tier: str, out_txt: Path, max_samples: int = 36) -> dict[str, Any]:
-    """Build multi-language (TypeScript, Go, C#/.NET 10) calibration corpus for llama-imatrix."""
-    rows = pq.read_table(REPO_ROOT / "data" / "processed" / tier / "sft_train.parquet").to_pylist()
-    per_lang: dict[str, list[str]] = {"typescript": [], "go": [], "csharp": []}
-    quota = max(1, max_samples // 3)
+def build_imatrix_calibration_file(
+    tier: str, out_txt: Path, max_samples: int = 36, data_dir: Path | None = None
+) -> dict[str, Any]:
+    """Build multi-language calibration corpus for llama-imatrix from the active Parquet dataset."""
+    src_dir = data_dir if data_dir else (REPO_ROOT / "data" / "processed" / tier)
+    rows = pq.read_table(src_dir / "sft_train.parquet").to_pylist()
+    per_lang: dict[str, list[str]] = {"typescript": [], "go": [], "csharp": [], "cpp": []}
+    present_langs = {str(r.get("language", "typescript")) for r in rows} & set(per_lang.keys())
+    quota = max(1, max_samples // max(len(present_langs), 1))
     for r in rows:
         lang = str(r.get("language", "typescript"))
         if lang in per_lang and len(per_lang[lang]) < quota:
             per_lang[lang].append(str(r.get("text", "")).strip())
 
-    blocks = per_lang["typescript"] + per_lang["go"] + per_lang["csharp"]
+    blocks = [txt for lang in ("typescript", "go", "csharp", "cpp") for txt in per_lang[lang]]
     out_txt.parent.mkdir(parents=True, exist_ok=True)
     out_txt.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
     return {
@@ -239,10 +197,21 @@ def benchmark_and_verify_gguf(gguf_path: Path, label: str, console: Console) -> 
     }
 
 
+def _resolve_adapter_dir(tier: str, adapter_name: str | None) -> Path:
+    suffix = f"{tier}-{adapter_name}" if adapter_name else tier
+    for stage in ("grpo", "dpo", "sft"):
+        cand = REPO_ROOT / "checkpoints" / f"{stage}-{suffix}" / "final_adapter"
+        if cand.exists():
+            return cand
+    return REPO_ROOT / "checkpoints" / f"dpo-{suffix}" / "final_adapter"
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Phase 5 LoRA Merge & GGUF Q8_0 / imatrix Q4_K_M Exporter.")
+    parser = argparse.ArgumentParser(description="Phase 5 Multi-Engine Exporter (llama.cpp GGUF/LoRA, Ollama, vLLM).")
     parser.add_argument("--tier", choices=("smoke", "dev", "full"), default="smoke")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    parser.add_argument("--data-dir", default=None)
+    parser.add_argument("--adapter-name", default=None)
     parser.add_argument("--adapter-dir", default=None)
     parser.add_argument("--merged-dir", default=None)
     parser.add_argument("--gguf-dir", default=None)
@@ -251,22 +220,33 @@ def main() -> int:
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    console = Console()
-    t_all = time.time()
-
-    adapter_dir = Path(args.adapter_dir) if args.adapter_dir else (REPO_ROOT / "checkpoints" / f"dpo-{args.tier}" / "final_adapter")
-    merged_dir = Path(args.merged_dir) if args.merged_dir else (REPO_ROOT / "outputs" / "merged-bf16")
+    console, t_all = Console(), time.time()
+    is_moe = "26b" in args.model_id.lower()
+    base_tag = "gemma-4-26B-A4B-coder" if is_moe else "gemma-4-E4B-coder"
+    model_tag = f"{base_tag}-{args.adapter_name}" if args.adapter_name else base_tag
+    adapter_dir = Path(args.adapter_dir) if args.adapter_dir else _resolve_adapter_dir(args.tier, args.adapter_name)
+    merged_dir = Path(args.merged_dir) if args.merged_dir else (
+        REPO_ROOT / "outputs" / (f"merged-bf16-{args.adapter_name}" if args.adapter_name else "merged-bf16")
+    )
     gguf_dir = Path(args.gguf_dir) if args.gguf_dir else (REPO_ROOT / "outputs" / "gguf")
     gguf_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = Path(args.data_dir) if args.data_dir else resolve_processed_dir(
+        args.tier, domain=args.adapter_name or "all"
+    )
+    if not data_dir.exists():
+        data_dir = REPO_ROOT / "data" / "processed" / args.tier
 
-    console.rule(f"[bold cyan]Phase 5 LoRA bfloat16 Merge & GGUF Export — Tier: {args.tier.upper()}")
-    merge_stats = merge_lora_to_bf16(args.model_id, adapter_dir, merged_dir, console, force=args.force)
+    console.rule(f"[bold cyan]Phase 5 Multi-Engine Export — {model_tag} ({adapter_dir.parent.name})")
+    merge_stats, base_snapshot = merge_lora_to_bf16(args.model_id, adapter_dir, merged_dir, console, force=args.force)
 
-    bf16_gguf = gguf_dir / "gemma-4-E4B-coder-bf16.gguf"
-    q8_0_gguf = gguf_dir / "gemma-4-E4B-coder-Q8_0.gguf"
-    q4_km_gguf = gguf_dir / "gemma-4-E4B-coder-Q4_K_M-imatrix.gguf"
-    imatrix_txt = gguf_dir / "imatrix_calibration.txt"
-    imatrix_file = gguf_dir / "gemma-4-E4B-coder.imatrix"
+    lora_gguf_out = gguf_dir / f"lora-{args.adapter_name or 'coder'}.gguf"
+    lora_gguf = export_lora_gguf(adapter_dir, lora_gguf_out, base_dir=base_snapshot)
+
+    bf16_gguf = gguf_dir / f"{model_tag}-bf16.gguf"
+    q8_0_gguf = gguf_dir / f"{model_tag}-Q8_0.gguf"
+    q4_km_gguf = gguf_dir / f"{model_tag}-Q4_K_M-imatrix.gguf"
+    imatrix_txt = gguf_dir / f"imatrix_calibration_{args.adapter_name or 'all'}.txt"
+    imatrix_file = gguf_dir / f"{model_tag}.imatrix"
 
     if args.force or not bf16_gguf.exists() or bf16_gguf.stat().st_size < 10_000_000_000:
         conv_sec, _ = _run_cmd(
@@ -275,7 +255,7 @@ def main() -> int:
             console,
         )
     else:
-        conv_sec = 14.2
+        conv_sec = 0.0
         console.print(f"[bold green]2/5 Reusing existing GGUF BF16 intermediate:[/bold green] {bf16_gguf}")
     bf16_gguf_bytes = bf16_gguf.stat().st_size
 
@@ -286,10 +266,10 @@ def main() -> int:
             console,
         )
     else:
-        q8_sec = 8.4
+        q8_sec = 0.0
         console.print(f"[bold green]3/5 Reusing existing Q8_0 GGUF:[/bold green] {q8_0_gguf}")
 
-    cal_stats = build_imatrix_calibration_file(args.tier, imatrix_txt, max_samples=36)
+    cal_stats = build_imatrix_calibration_file(args.tier, imatrix_txt, max_samples=36, data_dir=data_dir)
     imat_sec, _ = _run_cmd(
         [
             str(LLAMA_IMATRIX_BIN), "-m", str(q8_0_gguf), "-f", str(imatrix_txt), "-o", str(imatrix_file),
@@ -305,31 +285,33 @@ def main() -> int:
         "4b/5 Quantizing GGUF BF16 -> Q4_K_M with Importance Matrix",
         console,
     )
-
     if not args.keep_bf16_gguf and bf16_gguf.exists():
         bf16_gguf.unlink()
+
+    modelfile_path = write_ollama_modelfile(gguf_dir / f"Modelfile.{model_tag}", q4_km_gguf.name)
+    write_ollama_modelfile(gguf_dir / "Modelfile", q4_km_gguf.name)
+    vllm_script = write_vllm_serve_script(
+        gguf_dir / f"serve_vllm_{model_tag}.sh", merged_dir, model_tag.lower(), is_moe=is_moe
+    )
+    write_vllm_serve_script(gguf_dir / "serve_vllm.sh", merged_dir, model_tag.lower(), is_moe=is_moe)
 
     console.print("[bold green]5/5 Benchmarking & verifying exported Q8_0 and Q4_K_M-imatrix GGUF models...[/bold green]")
     q8_verify = benchmark_and_verify_gguf(q8_0_gguf, "Q8_0", console)
     q4_verify = benchmark_and_verify_gguf(q4_km_gguf, "Q4_K_M-imatrix", console)
 
-    tbl = Table(title="Phase 5 GGUF Export & Live Benchmark Summary")
-    for col in ("Artifact", "Size (GiB)", "Quant Time (s)", "Prompt pp256 (tok/s)", "Gen tg64 (tok/s)", "Live TS Compile"):
-        tbl.add_column(col)
-    tbl.add_row("merged-bf16 (safetensors)", f"{merge_stats['safetensors_size_gib']:.2f} GiB", f"{merge_stats['merge_elapsed_sec']:.1f}s", "—", "—", "—")
-    tbl.add_row(q8_0_gguf.name, f"{q8_verify['size_gib']:.2f} GiB", f"{q8_sec:.1f}s", f"{q8_verify['prompt_eval_tokens_per_sec_pp256']:.1f}", f"{q8_verify['generation_tokens_per_sec_tg64']:.1f}", "PASS" if q8_verify["live_typescript_compiler_passed"] else "FAIL")
-    tbl.add_row(q4_km_gguf.name, f"{q4_verify['size_gib']:.2f} GiB", f"{imat_sec + q4_sec:.1f}s (imat={imat_sec:.1f}s)", f"{q4_verify['prompt_eval_tokens_per_sec_pp256']:.1f}", f"{q4_verify['generation_tokens_per_sec_tg64']:.1f}", "PASS" if q4_verify["live_typescript_compiler_passed"] else "FAIL")
-    console.print(tbl)
-
     manifest = {
         "tier": args.tier,
+        "model_tag": model_tag,
         "total_elapsed_sec": round(time.time() - t_all, 2),
         "adapter_merged": str(adapter_dir),
+        "lora_gguf": str(lora_gguf) if lora_gguf else None,
+        "ollama_modelfile": str(modelfile_path),
+        "vllm_serve_script": str(vllm_script),
         "merge_bf16": merge_stats,
         "bf16_gguf_intermediate_bytes": bf16_gguf_bytes,
         "bf16_gguf_convert_elapsed_sec": conv_sec,
         "calibration": cal_stats,
-        "imatrix": {"imatrix_path": str(imatrix_file), "size_bytes": imatrix_file.stat().st_size, "chunks": args.imatrix_chunks, "elapsed_sec": imat_sec},
+        "imatrix": {"imatrix_path": str(imatrix_file), "chunks": args.imatrix_chunks, "elapsed_sec": imat_sec},
         "exports": {
             "Q8_0": {**q8_verify, "quantize_elapsed_sec": q8_sec},
             "Q4_K_M_imatrix": {**q4_verify, "quantize_elapsed_sec": q4_sec},
@@ -337,7 +319,7 @@ def main() -> int:
     }
     manifest_path = gguf_dir / "export_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    console.print(f"[bold green]Saved GGUF export manifest:[/bold green] {manifest_path}")
+    console.print(f"[bold green]Saved multi-engine export manifest:[/bold green] {manifest_path}")
     return 0
 
 
