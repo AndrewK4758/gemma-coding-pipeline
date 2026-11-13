@@ -184,23 +184,28 @@ def backward_dpo_pair_loss(
     return pair_loss.detach(), c_rew.detach(), r_rew.detach(), margin.detach()
 
 
+def _norm_logp(seq_lp: torch.Tensor, tok_cnt: torch.Tensor) -> torch.Tensor:
+    """Normalize sequence sum log-probability by completion token count for length invariance."""
+    return seq_lp / tok_cnt.to(device=seq_lp.device, dtype=seq_lp.dtype).clamp_min(1)
+
+
 @torch.no_grad()
 def precompute_reference_logps(
     model: PeftModel, samples: list[dict[str, Any]], ref_mode: str, desc: str, console: Console
 ) -> None:
-    """Pre-compute reference log-probs in torch.no_grad() using either the initial SFT adapter or disable_adapter()."""
+    """Pre-compute length-normalized reference log-probs using the initial adapter or disable_adapter()."""
     model.eval()
     t_start = time.time()
     for s in samples:
         if ref_mode == "disable_adapter":
             with model.disable_adapter():
-                c_lp, _ = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
-                r_lp, _ = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
+                c_lp, c_cnt = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
+                r_lp, r_cnt = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
         else:
-            c_lp, _ = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
-            r_lp, _ = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
-        s["ref_chosen_logp"] = float(c_lp.item())
-        s["ref_rejected_logp"] = float(r_lp.item())
+            c_lp, c_cnt = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
+            r_lp, r_cnt = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
+        s["ref_chosen_logp"] = float(_norm_logp(c_lp, c_cnt).item())
+        s["ref_rejected_logp"] = float(_norm_logp(r_lp, r_cnt).item())
     console.print(f"    Cached reference log-probs for [green]{len(samples)}[/green] {desc} pairs (mode={ref_mode}, {time.time() - t_start:.1f}s)")
 
 
@@ -208,24 +213,22 @@ def precompute_reference_logps(
 def evaluate_dpo(
     model: PeftModel, eval_samples: list[dict[str, Any]], beta: float, step: int, tb_writer: SummaryWriter
 ) -> dict[str, float]:
-    """Evaluate DPO loss, implicit rewards, reward margins, and preference accuracy on held-out eval split."""
+    """Evaluate length-normalized DPO loss, implicit rewards, reward margins, and preference accuracy."""
     model.eval()
     losses, c_rews, r_rews, margins, accs, c_logps, r_logps, logp_accs = [], [], [], [], [], [], [], []
     for s in eval_samples:
         pol_c_lp, c_cnt = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
         pol_r_lp, r_cnt = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
-        pol_c, pol_r = float(pol_c_lp.item()), float(pol_r_lp.item())
+        pol_c = float(_norm_logp(pol_c_lp, c_cnt).item())
+        pol_r = float(_norm_logp(pol_r_lp, r_cnt).item())
         c_rew = beta * (pol_c - float(s["ref_chosen_logp"]))
         r_rew = beta * (pol_r - float(s["ref_rejected_logp"]))
         margin = c_rew - r_rew
         losses.append(float(-F.logsigmoid(torch.tensor(margin, dtype=torch.float32)).item()))
-        c_rews.append(c_rew)
-        r_rews.append(r_rew)
-        margins.append(margin)
+        c_rews.append(c_rew); r_rews.append(r_rew); margins.append(margin)
         accs.append(1.0 if margin > 1e-7 else 0.0)
-        c_logps.append(pol_c)
-        r_logps.append(pol_r)
-        logp_accs.append(1.0 if (pol_c / c_cnt.item()) > (pol_r / r_cnt.item()) else 0.0)
+        c_logps.append(pol_c); r_logps.append(pol_r)
+        logp_accs.append(1.0 if pol_c > pol_r else 0.0)
 
     n = max(len(eval_samples), 1)
     metrics = {
@@ -251,7 +254,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sft-adapter", default=None)
     parser.add_argument("--max-seq-length", type=int, default=4096)
     parser.add_argument("--max-steps", type=int, default=15)
-    parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--beta", type=float, default=2.0)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--eval-steps", type=int, default=5)
@@ -317,20 +320,17 @@ def main() -> int:
         for _ in range(args.gradient_accumulation_steps):
             s = active_train[sample_idx % len(active_train)]
             sample_idx += 1
-            pol_c_lp, _ = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
-            pol_r_lp, _ = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
+            pol_c_lp, c_cnt = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
+            pol_r_lp, r_cnt = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
+            norm_c_lp, norm_r_lp = _norm_logp(pol_c_lp, c_cnt), _norm_logp(pol_r_lp, r_cnt)
             pair_loss, c_rew, r_rew, margin = backward_dpo_pair_loss(
-                pol_c_lp, pol_r_lp, float(s["ref_chosen_logp"]), float(s["ref_rejected_logp"]),
+                norm_c_lp, norm_r_lp, float(s["ref_chosen_logp"]), float(s["ref_rejected_logp"]),
                 args.beta, args.gradient_accumulation_steps,
             )
 
-            s_loss.append(float(pair_loss.item()))
-            s_cr.append(float(c_rew.item()))
-            s_rr.append(float(r_rew.item()))
-            s_m.append(float(margin.item()))
-            s_acc.append(1.0 if float(margin.item()) > 0.0 else 0.0)
-            s_clp.append(float(pol_c_lp.detach().item()))
-            s_rlp.append(float(pol_r_lp.detach().item()))
+            s_loss.append(float(pair_loss.item())); s_cr.append(float(c_rew.item())); s_rr.append(float(r_rew.item()))
+            s_m.append(float(margin.item())); s_acc.append(1.0 if float(margin.item()) > 0.0 else 0.0)
+            s_clp.append(float(norm_c_lp.detach().item())); s_rlp.append(float(norm_r_lp.detach().item()))
 
         grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item())
         lr_now = float(scheduler.get_last_lr()[0])

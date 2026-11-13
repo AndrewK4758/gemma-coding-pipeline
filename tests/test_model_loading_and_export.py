@@ -308,6 +308,71 @@ class TestModelLoadingAndExport(unittest.TestCase):
         for p_ref, p_seq in zip(lin_ref.parameters(), lin_seq.parameters()):
             self.assertTrue(torch.allclose(p_ref.grad, p_seq.grad, atol=1e-6))
 
+    def test_grpo_and_eval_generation_pass_logits_to_keep_and_microbatch(self) -> None:
+        from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+        from eval import benchmark_coding as bc
+        from run_pipeline import build_stage_commands, parse_args
+        from train import grpo_online as go
+
+        cfg = Gemma4TextConfig(
+            hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2,
+            num_key_value_heads=1, head_dim=16, global_head_dim=16, vocab_size=64,
+            hidden_size_per_layer_input=0, num_kv_shared_layers=0, layer_types=["full_attention"],
+        )
+        m = Gemma4ForCausalLM(cfg).eval()
+
+        class _Tok:
+            pad_token_id = 0
+            eos_token_id = 1
+            padding_side = "right"
+            special_tokens_map = {"sot_token": "<sot>", "eot_token": "<eot>"}
+
+            def convert_tokens_to_ids(self, _t: str) -> int:
+                return 2
+
+            def __call__(self, texts, return_tensors=None, padding=False, truncation=False, max_length=None, add_special_tokens=True):
+                items = [texts] if isinstance(texts, str) else list(texts)
+                seqs = [[(i + 5) % 60 for i in range(max(4, min(200, len(t.split()))))] for t in items]
+                if truncation and max_length:
+                    seqs = [s[:max_length] for s in seqs]
+                width = max(len(s) for s in seqs)
+                padded = [([0] * (width - len(s)) + s) if self.padding_side == "left" else (s + [0] * (width - len(s))) for s in seqs]
+                masks = [([0] * (width - len(s)) + [1] * len(s)) if self.padding_side == "left" else ([1] * len(s) + [0] * (width - len(s))) for s in seqs]
+                return {"input_ids": torch.tensor(padded), "attention_mask": torch.tensor(masks)}
+
+            def decode(self, ids, skip_special_tokens=True) -> str:
+                return f"tok_{len(ids)}"
+
+        calls: list[dict] = []
+        orig_gen = m.generate
+
+        def _spy_gen(*args, **kwargs):
+            calls.append({"shape": tuple(kwargs["input_ids"].shape), "logits_to_keep": kwargs.get("logits_to_keep")})
+            return orig_gen(*args, **kwargs)
+
+        tok = _Tok()
+        long_prompt = "word " * 180
+        with mock.patch.object(m, "generate", side_effect=_spy_gen):
+            outs = go.generate_group_completions(
+                m, tok, long_prompt, num_generations=4, max_new_tokens=32, max_seq_length=96, gen_batch_size=2
+            )
+            self.assertEqual(len(outs), 4)
+            self.assertEqual([c["shape"][0] for c in calls], [2, 2])
+            self.assertTrue(all(c["shape"][1] <= 64 for c in calls))
+            self.assertTrue(all(c["logits_to_keep"] == 1 for c in calls))
+
+            calls.clear()
+            with (
+                mock.patch.object(bc, "HELD_OUT_CODING_SUITE", [{"id": "t1", "language": "go", "category": "fn", "prompt": "hi"}]),
+                mock.patch.object(bc, "verify_code_sample", return_value=SimpleNamespace(passed=True, toolchain="go", diagnostics="OK")),
+            ):
+                res = bc.evaluate_live_compile_pass_at_1(m, tok, max_new_tokens=8, batch_size=1)
+            self.assertEqual(res["passed_count"], 1)
+            self.assertEqual(calls[0]["logits_to_keep"], 1)
+
+        plan = dict(build_stage_commands(parse_args(["--tier", "smoke", "--stages", "grpo"])))
+        self.assertIn("--max-seq-length", plan["grpo"])
+
 
 if __name__ == "__main__":
     unittest.main()

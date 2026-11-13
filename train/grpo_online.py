@@ -113,18 +113,26 @@ def generate_group_completions(
     prompt_text: str,
     num_generations: int = 4,
     max_new_tokens: int = 224,
+    max_seq_length: int = 2048,
+    gen_batch_size: int = 2,
 ) -> list[str]:
-    """Sample G candidate code completions for a single coding prompt with KV cache enabled."""
+    """Sample G candidate code completions in microbatches with logits_to_keep=1 and KV cache."""
     causal_lm = model.get_base_model() if hasattr(model, "get_base_model") else model
     sot = str(tokenizer.special_tokens_map.get("sot_token", "<start_of_turn>"))
     eot = str(tokenizer.special_tokens_map.get("eot_token", "<end_of_turn>"))
     chat_prompt = f"{sot}user\n{SYSTEM_PREAMBLE}\n\n{prompt_text.strip()}{eot}\n{sot}model\n"
 
     first_dev = get_input_device(causal_lm)
-    enc = tokenizer(chat_prompt, return_tensors="pt", add_special_tokens=True)
-    prompt_ids = enc["input_ids"].repeat(num_generations, 1).to(first_dev)
-    prompt_mask = enc["attention_mask"].repeat(num_generations, 1).to(first_dev)
-    prompt_len = prompt_ids.size(1)
+    max_prompt_tokens = max(16, max_seq_length - max_new_tokens)
+    enc = tokenizer(
+        chat_prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_prompt_tokens,
+        add_special_tokens=True,
+    )
+    base_ids, base_mask = enc["input_ids"].to(first_dev), enc["attention_mask"].to(first_dev)
+    prompt_len = base_ids.size(1)
 
     model.eval()
     causal_lm.gradient_checkpointing_disable()
@@ -137,18 +145,28 @@ def generate_group_completions(
     if isinstance(eot_id, int) and eot_id > 0 and eot_id not in eos_ids:
         eos_ids.append(eot_id)
 
+    completions: list[str] = []
+    step_bs = max(1, gen_batch_size)
     try:
-        out_ids = causal_lm.generate(
-            input_ids=prompt_ids,
-            attention_mask=prompt_mask,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=0.8,
-            top_p=0.95,
-            pad_token_id=int(tokenizer.pad_token_id or 0),
-            eos_token_id=eos_ids if eos_ids else None,
-            use_cache=True,
-        )
+        for start in range(0, num_generations, step_bs):
+            cur_bs = min(step_bs, num_generations - start)
+            out_ids = causal_lm.generate(
+                input_ids=base_ids.repeat(cur_bs, 1),
+                attention_mask=base_mask.repeat(cur_bs, 1),
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=0.8,
+                top_p=0.95,
+                pad_token_id=int(tokenizer.pad_token_id or 0),
+                eos_token_id=eos_ids if eos_ids else None,
+                logits_to_keep=1,
+                use_cache=True,
+            )
+            completions.extend(
+                tokenizer.decode(out_ids[i, prompt_len:], skip_special_tokens=True).strip()
+                for i in range(cur_bs)
+            )
+            del out_ids
     finally:
         causal_lm.config.use_cache = False
         if hasattr(causal_lm.config, "text_config"):
@@ -156,8 +174,10 @@ def generate_group_completions(
         causal_lm.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False, "context_fn": make_multigpu_rng_context_fn()}
         )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    return [tokenizer.decode(out_ids[i, prompt_len:], skip_special_tokens=True).strip() for i in range(num_generations)]
+    return completions
 
 
 def parse_args() -> argparse.Namespace:
@@ -224,7 +244,12 @@ def main() -> int:
         step_t0 = time.time()
 
         completions = generate_group_completions(
-            model, tokenizer, prompt_text, num_generations=args.num_generations, max_new_tokens=args.max_new_tokens
+            model,
+            tokenizer,
+            prompt_text,
+            num_generations=args.num_generations,
+            max_new_tokens=args.max_new_tokens,
+            max_seq_length=args.max_seq_length,
         )
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.num_generations, 4)) as pool:
             grades = list(pool.map(lambda c: grade_completion_rubric(c, lang, task=rec), completions))

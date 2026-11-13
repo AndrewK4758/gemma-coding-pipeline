@@ -148,7 +148,7 @@ def build_stage_commands(args: argparse.Namespace) -> list[tuple[str, list[str]]
             plan.append(
                 (
                     "grpo",
-                    [py, "train/grpo_online.py", *shared_train, "--max-steps", str(grpo_steps)],
+                    [py, "train/grpo_online.py", *shared_train, "--max-seq-length", str(seq_len), "--max-steps", str(grpo_steps)],
                 )
             )
         elif stage == "eval":

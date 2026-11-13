@@ -196,15 +196,19 @@ def evaluate_live_compile_pass_at_1(
                 do_sample=False,
                 pad_token_id=int(tokenizer.pad_token_id or 0),
                 eos_token_id=eos_ids if eos_ids else None,
+                logits_to_keep=1,
                 use_cache=True,
             )
             for idx in range(len(batch_items)):
                 generations.append(tokenizer.decode(out_ids[idx, in_ids.size(1) :], skip_special_tokens=True).strip())
+            del out_ids
     finally:
         tokenizer.padding_side = orig_padding_side
         causal_lm.config.use_cache = False
         if hasattr(causal_lm.config, "text_config"):
             causal_lm.config.text_config.use_cache = False
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     gen_elapsed = round(time.time() - t_gen, 2)
 
@@ -307,7 +311,7 @@ def main() -> int:
     dpo_gen = evaluate_live_compile_pass_at_1(model, tokenizer, max_new_tokens=args.max_new_tokens)
 
     results = {
-        "base": {"label": "Base (gemma-4-E4B-it)", "perplexity": base_ppl, "preference": base_pref, "live_coding": base_gen},
+        "base": {"label": f"Base ({args.model_id.split('/')[-1]})", "perplexity": base_ppl, "preference": base_pref, "live_coding": base_gen},
         "sft": {"label": f"Phase 3 SFT ({sft_dir.parent.name})", "perplexity": sft_ppl, "preference": sft_pref, "live_coding": sft_gen},
         "dpo": {"label": f"Phase 4 SFT+DPO ({dpo_dir.parent.name})", "perplexity": dpo_ppl, "preference": dpo_pref, "live_coding": dpo_gen},
     }
