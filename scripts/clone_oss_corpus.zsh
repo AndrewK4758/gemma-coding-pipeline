@@ -120,9 +120,24 @@ fi
 if (( SKIP_RESTORE == 0 )); then
   echo "[5/5] Pre-warming local NuGet, pnpm/npm, and Go module caches for offline GRPO execution..."
   if [[ -d "${CORPUS_DIR}/dotnet" ]]; then
+    local repo_root="${0:A:h:h}"
     for dir in "${CORPUS_DIR}/dotnet/"*(N/); do
       echo "  [nuget] ${dir:t}"
-      (cd "$dir" && dotnet restore --verbosity quiet || true)
+      local dn_bin="" dn_root="" dn_target=""
+      IFS=$'\t' read -r dn_bin dn_root dn_target < <(PYTHONPATH="${repo_root}" python3 -m data.dotnet_env "$dir" || true)
+      dn_bin="${dn_bin:-dotnet}"
+      (
+        cd "$dir"
+        if [[ -n "$dn_root" ]]; then
+          export DOTNET_ROOT="$dn_root"
+          export PATH="${dn_root}:${PATH}"
+        fi
+        if [[ -n "$dn_target" ]]; then
+          "$dn_bin" restore "$dn_target" --verbosity quiet || true
+        else
+          "$dn_bin" restore --verbosity quiet || true
+        fi
+      )
     done
   fi
   if [[ -d "${CORPUS_DIR}/react" ]]; then
