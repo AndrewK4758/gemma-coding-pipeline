@@ -309,10 +309,12 @@ class TestModelLoadingAndExport(unittest.TestCase):
             self.assertTrue(torch.allclose(p_ref.grad, p_seq.grad, atol=1e-6))
 
     def test_grpo_and_eval_generation_pass_logits_to_keep_and_microbatch(self) -> None:
+        import inspect
         from transformers import Gemma4ForCausalLM, Gemma4TextConfig
         from eval import benchmark_coding as bc
         from run_pipeline import build_stage_commands, parse_args
         from train import grpo_online as go
+        from train.model_loader import install_chunked_causal_lm_loss
 
         cfg = Gemma4TextConfig(
             hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2,
@@ -320,6 +322,9 @@ class TestModelLoadingAndExport(unittest.TestCase):
             hidden_size_per_layer_input=0, num_kv_shared_layers=0, layer_types=["full_attention"],
         )
         m = Gemma4ForCausalLM(cfg).eval()
+        install_chunked_causal_lm_loss(m)
+        self.assertTrue(m._supports_logits_to_keep())
+        self.assertIn("input_ids", inspect.signature(m.forward).parameters)
 
         class _Tok:
             pad_token_id = 0

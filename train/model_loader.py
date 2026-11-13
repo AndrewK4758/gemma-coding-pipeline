@@ -9,9 +9,9 @@ Supports both:
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 import tempfile
-import types
 from collections.abc import Callable
 from typing import Any
 
@@ -127,19 +127,22 @@ def install_chunked_causal_lm_loss(base_model: PreTrainedModel, chunk_size: int 
             logits_chunk = torch.tanh(logits_chunk / softcap) * softcap
         return F.cross_entropy(logits_chunk.float(), y_chunk, reduction="sum")
 
+    @functools.wraps(orig_forward)
     def _chunked_forward(
-        self: PreTrainedModel,
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         labels: torch.LongTensor | None = None,
         num_items_in_batch: int | torch.Tensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Any,
     ) -> Any:
         if labels is None:
+            if logits_to_keep != 0:
+                kwargs["logits_to_keep"] = logits_to_keep
             return orig_forward(input_ids=input_ids, attention_mask=attention_mask, labels=None, **kwargs)
 
         backbone_kwargs = {k: v for k, v in kwargs.items() if k not in ("logits_to_keep", "return_dict")}
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True, **backbone_kwargs)
+        outputs = base_model.model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True, **backbone_kwargs)
         hidden_states: torch.Tensor = outputs.last_hidden_state
         shift_h = hidden_states[:, :-1, :].contiguous().view(-1, hidden_states.size(-1))
         shift_y = labels[:, 1:].to(shift_h.device).contiguous().view(-1)
@@ -153,17 +156,14 @@ def install_chunked_causal_lm_loss(base_model: PreTrainedModel, chunk_size: int 
             for start in range(0, active_h.size(0), chunk_size):
                 h_slice, y_slice = active_h[start : start + chunk_size], active_y[start : start + chunk_size]
                 if torch.is_grad_enabled() and h_slice.requires_grad:
-                    chunk_loss = torch.utils.checkpoint.checkpoint(
-                        _chunk_nll, self.lm_head, h_slice, y_slice, use_reentrant=False
-                    )
+                    chunk_loss = torch.utils.checkpoint.checkpoint(_chunk_nll, base_model.lm_head, h_slice, y_slice, use_reentrant=False)
                 else:
-                    chunk_loss = _chunk_nll(self.lm_head, h_slice, y_slice)
+                    chunk_loss = _chunk_nll(base_model.lm_head, h_slice, y_slice)
                 total_nll = total_nll + chunk_loss
 
             denom = float(num_items_in_batch) if num_items_in_batch is not None else float(active_y.numel())
             loss = total_nll / max(denom, 1.0)
 
-        # Return a lightweight CausalLM output without keeping a 1.72 GiB [B, S, 262144] logits tensor alive
         return CausalLMOutputWithPast(
             loss=loss, logits=hidden_states[:, :1, :1],
             past_key_values=getattr(outputs, "past_key_values", None),
@@ -171,7 +171,7 @@ def install_chunked_causal_lm_loss(base_model: PreTrainedModel, chunk_size: int 
             attentions=getattr(outputs, "attentions", None),
         )
 
-    base_model.forward = types.MethodType(_chunked_forward, base_model)
+    base_model.forward = _chunked_forward
 
 
 def make_multigpu_rng_context_fn() -> Callable[[], tuple[Any, Any]]:
