@@ -23,9 +23,54 @@ DEFAULT_SYSTEM_PROMPT = (
     "Output concise reasoning and complete, strictly typed, compiler-verified code or minimal diffs."
 )
 
-LLAMA_CPP_LORA_SCRIPT = Path(
-    os.environ.get("LLAMA_CPP_LORA_SCRIPT", str(Path(os.environ.get("LLAMA_CPP_DIR", str(Path.home() / "llama.cpp"))) / "convert_lora_to_gguf.py"))
-)
+def resolve_llama_cpp_dir() -> Path:
+    """Locate a llama.cpp checkout via env override or common install paths."""
+    env_dir = os.environ.get("LLAMA_CPP_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser()
+    candidates = (
+        Path.home() / "llama.cpp",
+        Path.home() / "projects" / "llama.cpp",
+    )
+    for cand in candidates:
+        if (cand / "convert_hf_to_gguf.py").exists():
+            return cand
+    for cand in candidates:
+        if cand.is_dir():
+            return cand
+    return candidates[0]
+
+
+def resolve_llama_cpp_script(filename: str, env_var: str | None = None) -> Path:
+    """Locate a llama.cpp Python converter script, honoring explicit env overrides."""
+    if env_var:
+        env_val = os.environ.get(env_var, "").strip()
+        if env_val:
+            return Path(env_val).expanduser()
+    return resolve_llama_cpp_dir() / filename
+
+
+def resolve_llama_cpp_bin(name: str, env_var: str | None = None) -> Path:
+    """Locate a compiled llama.cpp binary via env override, PATH, /usr/local/bin, or build tree."""
+    if env_var:
+        env_val = os.environ.get(env_var, "").strip()
+        if env_val:
+            return Path(env_val).expanduser()
+    which_hit = shutil.which(name)
+    if which_hit:
+        return Path(which_hit)
+    usr_local = Path("/usr/local/bin") / name
+    if usr_local.exists():
+        return usr_local
+    llama_dir = resolve_llama_cpp_dir()
+    for build_rel in ("build/bin", "build"):
+        cand = llama_dir / build_rel / name
+        if cand.exists():
+            return cand
+    return usr_local
+
+
+LLAMA_CPP_LORA_SCRIPT = resolve_llama_cpp_script("convert_lora_to_gguf.py", "LLAMA_CPP_LORA_SCRIPT")
 
 
 def _match_pattern(pattern_map: dict[str, Any], mod_name: str, default: float) -> float:
@@ -231,6 +276,9 @@ def write_vllm_serve_script(
 def export_lora_gguf(adapter_dir: Path, out_gguf: Path, base_dir: Path) -> Path | None:
     """Convert a PEFT LoRA adapter into a standalone hot-swappable GGUF overlay."""
     if not LLAMA_CPP_LORA_SCRIPT.exists():
+        sys.stderr.write(
+            f"[warn] Skipping standalone GGUF LoRA export: converter script not found at {LLAMA_CPP_LORA_SCRIPT}\n"
+        )
         return None
     out_gguf.parent.mkdir(parents=True, exist_ok=True)
     cmd = [

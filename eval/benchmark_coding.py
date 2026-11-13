@@ -161,7 +161,7 @@ def evaluate_compiler_preference(
 
 @torch.no_grad()
 def evaluate_live_compile_pass_at_1(
-    model: PeftModel, tokenizer: PreTrainedTokenizerBase, max_new_tokens: int = 192, batch_size: int = 5
+    model: PeftModel, tokenizer: PreTrainedTokenizerBase, max_new_tokens: int = 512, batch_size: int = 5
 ) -> dict[str, Any]:
     """Run deterministic greedy decoding (do_sample=False) across HELD_OUT_CODING_SUITE and verify in compiler sandbox."""
     causal_lm = model.get_base_model() if hasattr(model, "get_base_model") else model
@@ -263,7 +263,7 @@ def main() -> int:
     parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--sft-adapter", default=None)
     parser.add_argument("--dpo-adapter", default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=192)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--output-path", default=None)
     args = parser.parse_args()
 

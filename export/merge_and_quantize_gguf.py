@@ -45,17 +45,21 @@ from data.compiler_sandbox import verify_code_sample
 from export.multi_engine import (  # noqa: F401
     export_lora_gguf,
     merge_lora_weights_into_shards,
+    resolve_llama_cpp_bin,
+    resolve_llama_cpp_dir,
+    resolve_llama_cpp_script,
     write_ollama_modelfile,
     write_vllm_serve_script,
 )
 from train.model_loader import DEFAULT_MODEL_ID, resolve_checkpoint_id
 
-LLAMA_CPP_DIR = Path(os.environ.get("LLAMA_CPP_DIR", str(Path.home() / "llama.cpp")))
-LLAMA_CPP_CONVERT_SCRIPT = Path(os.environ.get("LLAMA_CPP_CONVERT_SCRIPT", str(LLAMA_CPP_DIR / "convert_hf_to_gguf.py")))
-LLAMA_QUANTIZE_BIN = Path("/usr/local/bin/llama-quantize")
-LLAMA_IMATRIX_BIN = Path("/usr/local/bin/llama-imatrix")
-LLAMA_BENCH_BIN = Path("/usr/local/bin/llama-bench")
-LLAMA_COMPLETION_BIN = Path("/usr/local/bin/llama-completion")
+LLAMA_CPP_DIR = resolve_llama_cpp_dir()
+LLAMA_CPP_CONVERT_SCRIPT = resolve_llama_cpp_script("convert_hf_to_gguf.py", "LLAMA_CPP_CONVERT_SCRIPT")
+LLAMA_QUANTIZE_BIN = resolve_llama_cpp_bin("llama-quantize", "LLAMA_QUANTIZE_BIN")
+LLAMA_IMATRIX_BIN = resolve_llama_cpp_bin("llama-imatrix", "LLAMA_IMATRIX_BIN")
+LLAMA_BENCH_BIN = resolve_llama_cpp_bin("llama-bench", "LLAMA_BENCH_BIN")
+LLAMA_COMPLETION_BIN = resolve_llama_cpp_bin("llama-completion", "LLAMA_COMPLETION_BIN")
+DEFAULT_TENSOR_SPLIT = os.environ.get("LLAMA_TENSOR_SPLIT", "65,35")
 
 
 def _ensure_train_gpu_mode(console: Console) -> None:
@@ -156,7 +160,7 @@ def build_imatrix_calibration_file(
     }
 
 
-def _run_cmd(cmd: list[str], desc: str, console: Console, needs_gpu: bool = False, timeout: int = 900) -> tuple[float, str]:
+def _run_cmd(cmd: list[str], desc: str, console: Console, needs_gpu: bool = False, timeout: int = 1800) -> tuple[float, str]:
     if needs_gpu:
         _ensure_train_gpu_mode(console)
     console.print(f"[bold cyan]>>> {desc}:[/bold cyan] {' '.join(cmd)}")
@@ -185,7 +189,7 @@ def benchmark_and_verify_gguf(
     gpu_extra = list(extra_gpu_args or [])
     bench_cmd = [
         str(LLAMA_BENCH_BIN), "-m", str(gguf_path), "-p", "256", "-n", "64", "-r", "2",
-        "-ngl", "99", *gpu_extra, "-sm", "layer", "-ts", "60/40", "-o", "json",
+        "-ngl", "99", *gpu_extra, "-sm", "layer", "-ts", DEFAULT_TENSOR_SPLIT.replace(",", "/"), "-o", "json",
     ]
     bench_sec, bench_out = _run_cmd(bench_cmd, f"llama-bench ({label})", console, needs_gpu=True, timeout=300)
     pp_tps, tg_tps = 0.0, 0.0
@@ -206,8 +210,8 @@ def benchmark_and_verify_gguf(
     )
     gen_cmd = [
         str(LLAMA_COMPLETION_BIN), "-m", str(gguf_path), "-ngl", "99", *gpu_extra,
-        "--split-mode", "layer", "--tensor-split", "60,40",
-        "-c", "1024", "-n", "128", "--temp", "0", "-no-cnv", "--simple-io", "-p", prompt,
+        "--split-mode", "layer", "--tensor-split", DEFAULT_TENSOR_SPLIT,
+        "-c", "1024", "-n", "384", "--temp", "0", "-no-cnv", "--simple-io", "-p", prompt,
     ]
     gen_sec, gen_out = _run_cmd(gen_cmd, f"llama-completion live verify ({label})", console, needs_gpu=True, timeout=180)
     model_reply = gen_out.split("<|turn>model")[-1] if "<|turn>model" in gen_out else gen_out
@@ -267,7 +271,7 @@ def resolve_export_paths(
         "merged_dir": resolved_merged,
         "gguf_dir": resolved_gguf,
         "lora_gguf_out": resolved_gguf / f"lora-{model_tag}.gguf",
-        "q8_extra_gpu_args": ["-ncmoe", "10"] if is_moe else [],
+        "q8_extra_gpu_args": ["-ncmoe", "16"] if is_moe else [],
     }
 
 
@@ -341,7 +345,7 @@ def main() -> int:
         [
             str(LLAMA_IMATRIX_BIN), "-m", str(q8_0_gguf), "-f", str(imatrix_txt), "-o", str(imatrix_file),
             "-c", "512", "--chunks", str(args.imatrix_chunks), "-ngl", "99", *q8_extra_gpu_args,
-            "--split-mode", "layer", "--tensor-split", "60,40", "--no-ppl",
+            "--split-mode", "layer", "--tensor-split", DEFAULT_TENSOR_SPLIT, "--no-ppl",
         ],
         f"4/5 Computing activation Importance Matrix ({args.imatrix_chunks} chunks on Dual GPUs)",
         console,

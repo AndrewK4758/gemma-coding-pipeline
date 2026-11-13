@@ -122,7 +122,7 @@ class TestModelLoadingAndExport(unittest.TestCase):
             self.assertEqual(e4b_default["merged_dir"], root / "outputs" / "merged-bf16")
             self.assertEqual(moe_default["merged_dir"], root / "outputs" / "merged-bf16-gemma-4-26B-A4B-coder")
             self.assertNotEqual(e4b_default["merged_dir"], moe_default["merged_dir"])
-            self.assertEqual(moe_default["q8_extra_gpu_args"], ["-ncmoe", "10"])
+            self.assertEqual(moe_default["q8_extra_gpu_args"], ["-ncmoe", "16"])
             self.assertEqual(e4b_default["q8_extra_gpu_args"], [])
 
     def test_train_26b_all_languages_script_dry_run(self) -> None:
@@ -396,6 +396,44 @@ class TestModelLoadingAndExport(unittest.TestCase):
         explicit = dict(build_stage_commands(parse_args(["--tier", "full", "--stages", "sft,dpo", "--sft-eval-steps", "100", "--dpo-eval-steps", "75"])))
         self.assertEqual(_flag(explicit["sft"], "--eval-steps"), "100")
         self.assertEqual(_flag(explicit["dpo"], "--eval-steps"), "75")
+
+    def test_resolve_llama_cpp_paths_and_token_budgets(self) -> None:
+        import inspect
+        from export.multi_engine import resolve_llama_cpp_bin, resolve_llama_cpp_dir, resolve_llama_cpp_script
+        import eval.benchmark_coding as bc
+        import train.grpo_online as go
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            proj_llama = fake_home / "projects" / "llama.cpp"
+            proj_llama.mkdir(parents=True)
+            (proj_llama / "convert_hf_to_gguf.py").write_text("# stub\n")
+            bin_dir = proj_llama / "build" / "bin"
+            bin_dir.mkdir(parents=True)
+            fake_quant = bin_dir / "llama-quantize"
+            fake_quant.write_text("#!/bin/sh\n")
+
+            with (
+                mock.patch.dict(os.environ, {"LLAMA_CPP_DIR": "", "LLAMA_QUANTIZE_BIN": ""}, clear=False),
+                mock.patch("export.multi_engine.Path.home", return_value=fake_home),
+                mock.patch("export.multi_engine.shutil.which", return_value=None),
+            ):
+                self.assertEqual(resolve_llama_cpp_dir(), proj_llama)
+                self.assertEqual(resolve_llama_cpp_script("convert_lora_to_gguf.py"), proj_llama / "convert_lora_to_gguf.py")
+                with mock.patch.dict(os.environ, {"LLAMA_QUANTIZE_BIN": str(fake_quant)}, clear=False):
+                    self.assertEqual(resolve_llama_cpp_bin("llama-quantize", "LLAMA_QUANTIZE_BIN"), fake_quant)
+                if not Path("/usr/local/bin/llama-custom-missing").exists():
+                    custom_bin = bin_dir / "llama-custom-missing"
+                    custom_bin.write_text("#!/bin/sh\n")
+                    self.assertEqual(resolve_llama_cpp_bin("llama-custom-missing"), custom_bin)
+
+            override_dir = fake_home / "custom_llama"
+            with mock.patch.dict(os.environ, {"LLAMA_CPP_DIR": str(override_dir)}, clear=False):
+                self.assertEqual(resolve_llama_cpp_dir(), override_dir)
+                self.assertEqual(resolve_llama_cpp_script("convert_hf_to_gguf.py", "LLAMA_CPP_CONVERT_SCRIPT"), override_dir / "convert_hf_to_gguf.py")
+
+        self.assertGreaterEqual(inspect.signature(bc.evaluate_live_compile_pass_at_1).parameters["max_new_tokens"].default, 512)
+        self.assertGreaterEqual(inspect.signature(go.generate_group_completions).parameters["max_new_tokens"].default, 384)
 
 
 if __name__ == "__main__":

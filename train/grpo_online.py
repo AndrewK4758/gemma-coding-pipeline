@@ -112,7 +112,7 @@ def generate_group_completions(
     tokenizer: PreTrainedTokenizerBase,
     prompt_text: str,
     num_generations: int = 4,
-    max_new_tokens: int = 224,
+    max_new_tokens: int = 384,
     max_seq_length: int = 2048,
     gen_batch_size: int = 2,
 ) -> list[str]:
@@ -190,7 +190,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-path", default=None)
     parser.add_argument("--max-steps", type=int, default=2)
     parser.add_argument("--num-generations", type=int, default=4)
-    parser.add_argument("--max-new-tokens", type=int, default=224)
+    parser.add_argument("--max-new-tokens", type=int, default=384)
     parser.add_argument("--max-seq-length", type=int, default=2048)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--kl-beta", type=float, default=0.04)
