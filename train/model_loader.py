@@ -115,8 +115,8 @@ def build_asymmetric_device_map(
     return device_map
 
 
-def install_chunked_causal_lm_loss(base_model: PreTrainedModel, chunk_size: int = 256) -> None:
-    """Replace full-sequence 262k-vocab logit materialization (~6.8 GiB) with 256-token chunked cross-entropy (~250 MiB)."""
+def install_chunked_causal_lm_loss(base_model: PreTrainedModel, chunk_size: int = 512) -> None:
+    """Replace full-sequence 262k-vocab logit materialization (~6.8 GiB) with chunked cross-entropy."""
     orig_forward = base_model.forward
     text_cfg = base_model.config.get_text_config() if hasattr(base_model.config, "get_text_config") else base_model.config
     softcap: float | None = getattr(text_cfg, "final_logit_softcapping", None)
@@ -142,6 +142,14 @@ def install_chunked_causal_lm_loss(base_model: PreTrainedModel, chunk_size: int 
             return orig_forward(input_ids=input_ids, attention_mask=attention_mask, labels=None, **kwargs)
 
         backbone_kwargs = {k: v for k, v in kwargs.items() if k not in ("logits_to_keep", "return_dict")}
+        if (
+            backbone_kwargs.get("position_ids") is not None
+            and attention_mask is None
+            and backbone_kwargs.get("past_key_values") is None
+        ):
+            # Gemma4TextModel.forward allocates DynamicCache whenever use_cache=True (default in model.eval()),
+            # which disables find_packed_sequence_indices(position_ids) in transformers.masking_utils.
+            backbone_kwargs["use_cache"] = False
         outputs = base_model.model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True, **backbone_kwargs)
         hidden_states: torch.Tensor = outputs.last_hidden_state
         shift_h = hidden_states[:, :-1, :].contiguous().view(-1, hidden_states.size(-1))
@@ -152,9 +160,10 @@ def install_chunked_causal_lm_loss(base_model: PreTrainedModel, chunk_size: int 
         if active_y.numel() == 0:
             loss = (hidden_states[:, :1, :].sum() * 0.0).float()
         else:
+            step_chunk = chunk_size if (torch.is_grad_enabled() and active_h.requires_grad) else max(chunk_size, 1024)
             total_nll = torch.zeros((), device=active_h.device, dtype=torch.float32)
-            for start in range(0, active_h.size(0), chunk_size):
-                h_slice, y_slice = active_h[start : start + chunk_size], active_y[start : start + chunk_size]
+            for start in range(0, active_h.size(0), step_chunk):
+                h_slice, y_slice = active_h[start : start + step_chunk], active_y[start : start + step_chunk]
                 if torch.is_grad_enabled() and h_slice.requires_grad:
                     chunk_loss = torch.utils.checkpoint.checkpoint(_chunk_nll, base_model.lm_head, h_slice, y_slice, use_reentrant=False)
                 else:
@@ -302,7 +311,7 @@ def load_sharded_base_model(
                 finalize_disk_offloaded_moe_layers(base_model, layer_device_map=layer_devs)
             if console is not None:
                 console.print(f"[cyan]Quantized {replaced} Gemma 4 MoE expert layers to 4-bit NF4 on target GPUs.[/cyan]")
-    install_chunked_causal_lm_loss(base_model, chunk_size=256)
+    install_chunked_causal_lm_loss(base_model, chunk_size=512)
     return base_model, tokenizer
 
 
@@ -380,7 +389,7 @@ def load_sharded_lora_model_and_tokenizer(
     tbl.add_column("Value", style="green")
     for k, v in (
         ("Resolved Model ID", f"{resolved_id} ({model_type}, {quant_label})"),
-        ("Attention Backend", f"{attn_arg} + 256-Token Chunked Vocab Cross-Entropy"),
+        ("Attention Backend", f"{attn_arg} + 512/1024-Token Chunked Vocab Cross-Entropy"),
         ("LoRA Config", lora_desc),
         ("Parameters (Trainable / Frozen / Total)", f"{param_stats['trainable_params']:,} / {param_stats['frozen_params']:,} / {param_stats['total_params']:,} ({param_stats['trainable_pct']}%)"),
     ):

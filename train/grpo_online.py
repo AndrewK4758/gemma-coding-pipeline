@@ -4,7 +4,7 @@
 Samples G candidate code completions per prompt (--num-generations 4), grades each completion
 in the real TypeScript 6.0.3 / Go 1.24 / .NET 10 Roslyn compiler sandbox, computes group-normalized
 advantages A_i = (r_i - mean(r)) / max(std(r), 1e-4), and performs a KL-regularized policy-gradient
-LoRA update using 256-token chunked sequence log-probabilities.
+LoRA update using chunked sequence log-probabilities.
 
 Usage:
     ./scripts/gpu-mode.zsh train
@@ -44,7 +44,7 @@ if str(REPO_ROOT) not in sys.path:
 from data.build_dataset import SYSTEM_PREAMBLE
 from data.compiler_sandbox import SandboxResult, extract_diff_block, verify_code_sample, verify_oss_worktree_patch
 from data.ingest_sources import extract_fenced_code
-from train.dpo_compiler import _encode_padded_tensors, compute_chunked_sequence_logps
+from train.dpo_compiler import _encode_padded_tensors, compute_batched_sequence_logps, compute_chunked_sequence_logps
 from train.model_loader import (
     DEFAULT_MODEL_ID,
     get_input_device,
@@ -250,6 +250,7 @@ def main() -> int:
             num_generations=args.num_generations,
             max_new_tokens=args.max_new_tokens,
             max_seq_length=args.max_seq_length,
+            gen_batch_size=args.num_generations,
         )
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.num_generations, 4)) as pool:
             grades = list(pool.map(lambda c: grade_completion_rubric(c, lang, task=rec), completions))
@@ -267,17 +268,33 @@ def main() -> int:
         mean_r, std_r = statistics.mean(rewards), statistics.pstdev(rewards)
         advantages = [(r - mean_r) / max(std_r, 1e-4) for r in rewards]
 
+        model.eval()
+        encoded_items = [
+            _encode_padded_tensors(prompt_text, completions[idx], tokenizer, args.max_seq_length)
+            for idx in range(args.num_generations)
+        ]
+        with torch.no_grad(), model.disable_adapter():
+            ref_results = compute_batched_sequence_logps(
+                model,
+                encoded_items,
+                pad_token_id=int(tokenizer.pad_token_id or 0),
+                max_batch_tokens=max(4096, args.max_seq_length * 2),
+                max_batch_size=max(1, args.num_generations),
+            )
+
         model.train()
         optimizer.zero_grad(set_to_none=True)
         group_losses, group_pg, group_kl = [], [], []
 
         for idx in range(args.num_generations):
-            ids_t, mask_t, lbls_t = _encode_padded_tensors(prompt_text, completions[idx], tokenizer, args.max_seq_length)
-            with torch.no_grad(), model.disable_adapter():
-                ref_seq_lp, tok_cnt = compute_chunked_sequence_logps(model, ids_t, mask_t, lbls_t)
+            ids_t, mask_t, lbls_t = encoded_items[idx]
+            ref_seq_lp_val, ref_cnt_val = ref_results[idx]
 
             pol_seq_lp, tok_cnt = compute_chunked_sequence_logps(model, ids_t, mask_t, lbls_t)
-            pol_tok_lp, ref_tok_lp = pol_seq_lp / tok_cnt, ref_seq_lp.detach() / tok_cnt
+            pol_tok_lp = pol_seq_lp / tok_cnt
+            ref_tok_lp = torch.tensor(
+                [ref_seq_lp_val / max(ref_cnt_val, 1.0)], device=pol_tok_lp.device, dtype=torch.float32
+            )
             log_ratio = ref_tok_lp - pol_tok_lp
             kl_est = torch.exp(torch.clamp(log_ratio, min=-10.0, max=10.0)) - log_ratio - 1.0
             adv_t = torch.tensor([advantages[idx]], device=pol_tok_lp.device, dtype=torch.float32)

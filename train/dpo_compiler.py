@@ -4,7 +4,7 @@
 Loads the Phase 3 SFT LoRA adapter (`checkpoints/sft-<tier>/final_adapter`) atop the
 42-layer asymmetrically sharded `google/gemma-4-E4B-it` backbone (`cuda:1` 16 GB +
 `cuda:0` 12 GB) and aligns the policy on compiler-verified `(prompt, chosen, rejected)`
-preference pairs using 256-token chunked sequence log-probabilities (`compute_chunked_sequence_logps`).
+preference pairs using chunked sequence log-probabilities (`compute_chunked_sequence_logps`).
 
 Usage:
     ./scripts/gpu-mode.zsh train
@@ -15,9 +15,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import random
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -84,9 +86,9 @@ def compute_chunked_sequence_logps(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     labels: torch.Tensor,
-    chunk_size: int = 256,
+    chunk_size: int = 512,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute exact sequence log-probabilities over completion tokens (labels != -100) in 256-token chunks."""
+    """Compute exact sequence log-probabilities over completion tokens (labels != -100) in chunk_size slices."""
     causal_lm = model.get_base_model() if hasattr(model, "get_base_model") else model
     text_cfg = causal_lm.config.get_text_config() if hasattr(causal_lm.config, "get_text_config") else causal_lm.config
     softcap: float | None = getattr(text_cfg, "final_logit_softcapping", None)
@@ -120,10 +122,11 @@ def compute_chunked_sequence_logps(
         if active_y.numel() == 0:
             seq_logp = (hidden_states[b_idx, :1, :].sum() * 0.0).float()
         else:
+            step_chunk = chunk_size if (torch.is_grad_enabled() and active_h.requires_grad) else max(chunk_size, 1024)
             seq_logp = torch.zeros((), device=head_dev, dtype=torch.float32)
-            for start in range(0, active_h.size(0), chunk_size):
-                h_slice = active_h[start : start + chunk_size]
-                y_slice = active_y[start : start + chunk_size]
+            for start in range(0, active_h.size(0), step_chunk):
+                h_slice = active_h[start : start + step_chunk]
+                y_slice = active_y[start : start + step_chunk]
                 if torch.is_grad_enabled() and h_slice.requires_grad:
                     chunk_lp = torch.utils.checkpoint.checkpoint(
                         _chunk_logp_sum, causal_lm.lm_head, h_slice, y_slice, use_reentrant=False
@@ -190,22 +193,75 @@ def _norm_logp(seq_lp: torch.Tensor, tok_cnt: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
+def compute_batched_sequence_logps(
+    model: PeftModel | nn.Module,
+    items: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    pad_token_id: int = 0,
+    max_batch_tokens: int = 4096,
+    max_batch_size: int = 4,
+) -> list[tuple[float, float]]:
+    """Compute exact (seq_logp, valid_token_count) pairs in length-bucketed `no_grad` microbatches."""
+    if not items:
+        return []
+    indexed = [(idx, ids, mask, lbls, int(ids.size(1))) for idx, (ids, mask, lbls) in enumerate(items)]
+    indexed.sort(key=lambda entry: entry[4], reverse=True)
+    results: list[tuple[float, float]] = [(0.0, 1.0)] * len(items)
+
+    pos = 0
+    while pos < len(indexed):
+        max_len = indexed[pos][4]
+        group = [indexed[pos]]
+        pos += 1
+        while pos < len(indexed) and len(group) < max_batch_size:
+            if (len(group) + 1) * max_len > max_batch_tokens:
+                break
+            group.append(indexed[pos])
+            pos += 1
+
+        if len(group) == 1:
+            orig_idx, ids, mask, lbls, _ = group[0]
+            seq_lp, tok_cnt = compute_chunked_sequence_logps(model, ids, mask, lbls)
+            results[orig_idx] = (float(seq_lp.reshape(-1)[0].item()), float(tok_cnt.reshape(-1)[0].item()))
+            continue
+
+        width = max_len if max_len % 8 == 0 else ((max_len // 8) + 1) * 8
+        bsz = len(group)
+        b_ids = torch.full((bsz, width), pad_token_id, dtype=group[0][1].dtype)
+        b_mask = torch.zeros((bsz, width), dtype=group[0][2].dtype)
+        b_lbls = torch.full((bsz, width), -100, dtype=group[0][3].dtype)
+        for j, (_, ids, mask, lbls, seq_l) in enumerate(group):
+            b_ids[j, :seq_l] = ids[0, :seq_l]
+            b_mask[j, :seq_l] = mask[0, :seq_l]
+            b_lbls[j, :seq_l] = lbls[0, :seq_l]
+
+        lps, cnts = compute_chunked_sequence_logps(model, b_ids, b_mask, b_lbls)
+        for j, (orig_idx, _, _, _, _) in enumerate(group):
+            results[orig_idx] = (float(lps[j].item()), float(cnts[j].item()))
+
+    return results
+
+
+@torch.no_grad()
 def precompute_reference_logps(
     model: PeftModel, samples: list[dict[str, Any]], ref_mode: str, desc: str, console: Console
 ) -> None:
-    """Pre-compute length-normalized reference log-probs using the initial adapter or disable_adapter()."""
+    """Pre-compute length-normalized reference log-probs using length-sorted `no_grad` microbatches."""
+    if not samples:
+        return
     model.eval()
     t_start = time.time()
-    for s in samples:
-        if ref_mode == "disable_adapter":
-            with model.disable_adapter():
-                c_lp, c_cnt = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
-                r_lp, r_cnt = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
-        else:
-            c_lp, c_cnt = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
-            r_lp, r_cnt = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
-        s["ref_chosen_logp"] = float(_norm_logp(c_lp, c_cnt).item())
-        s["ref_rejected_logp"] = float(_norm_logp(r_lp, r_cnt).item())
+    pad_id = int(getattr(getattr(model, "config", None), "pad_token_id", 0) or 0)
+    chosen_items = [(s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"]) for s in samples]
+    rejected_items = [(s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"]) for s in samples]
+
+    ctx = model.disable_adapter() if ref_mode == "disable_adapter" else contextlib.nullcontext()
+    with ctx:
+        chosen_res = compute_batched_sequence_logps(model, chosen_items, pad_token_id=pad_id)
+        rejected_res = compute_batched_sequence_logps(model, rejected_items, pad_token_id=pad_id)
+
+    for s, (c_lp, c_cnt), (r_lp, r_cnt) in zip(samples, chosen_res, rejected_res):
+        s["ref_chosen_logp"] = float(c_lp / max(c_cnt, 1.0))
+        s["ref_rejected_logp"] = float(r_lp / max(r_cnt, 1.0))
     console.print(f"    Cached reference log-probs for [green]{len(samples)}[/green] {desc} pairs (mode={ref_mode}, {time.time() - t_start:.1f}s)")
 
 
@@ -215,12 +271,16 @@ def evaluate_dpo(
 ) -> dict[str, float]:
     """Evaluate length-normalized DPO loss, implicit rewards, reward margins, and preference accuracy."""
     model.eval()
+    pad_id = int(getattr(getattr(model, "config", None), "pad_token_id", 0) or 0)
+    chosen_items = [(s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"]) for s in eval_samples]
+    rejected_items = [(s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"]) for s in eval_samples]
+    chosen_res = compute_batched_sequence_logps(model, chosen_items, pad_token_id=pad_id)
+    rejected_res = compute_batched_sequence_logps(model, rejected_items, pad_token_id=pad_id)
+
     losses, c_rews, r_rews, margins, accs, c_logps, r_logps, logp_accs = [], [], [], [], [], [], [], []
-    for s in eval_samples:
-        pol_c_lp, c_cnt = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
-        pol_r_lp, r_cnt = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
-        pol_c = float(_norm_logp(pol_c_lp, c_cnt).item())
-        pol_r = float(_norm_logp(pol_r_lp, r_cnt).item())
+    for s, (pol_c_lp, c_cnt), (pol_r_lp, r_cnt) in zip(eval_samples, chosen_res, rejected_res):
+        pol_c = float(pol_c_lp / max(c_cnt, 1.0))
+        pol_r = float(pol_r_lp / max(r_cnt, 1.0))
         c_rew = beta * (pol_c - float(s["ref_chosen_logp"]))
         r_rew = beta * (pol_r - float(s["ref_rejected_logp"]))
         margin = c_rew - r_rew
@@ -258,6 +318,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--eval-steps", type=int, default=5)
+    parser.add_argument("--max-eval-samples", type=int, default=0, help="Subsample mid-run DPO eval split if > 0 (0=all).")
+    parser.add_argument("--save-steps", type=int, default=0, help="Save periodic adapter checkpoints every N steps if > 0.")
     parser.add_argument("--ref-mode", choices=("precompute_sft", "disable_adapter"), default="precompute_sft")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--logging-dir", default=None)
@@ -287,7 +349,12 @@ def main() -> int:
 
     data_dir = Path(args.data_dir) if args.data_dir else (REPO_ROOT / "data" / "processed" / args.tier)
     all_train = load_dpo_split(data_dir / "dpo_train.parquet", tokenizer, max_seq_length=args.max_seq_length)
-    eval_samples = load_dpo_split(data_dir / "dpo_eval.parquet", tokenizer, max_seq_length=args.max_seq_length)
+    raw_eval = load_dpo_split(data_dir / "dpo_eval.parquet", tokenizer, max_seq_length=args.max_seq_length)
+    if args.max_eval_samples > 0 and len(raw_eval) > args.max_eval_samples:
+        step_sz = len(raw_eval) / float(args.max_eval_samples)
+        eval_samples = [raw_eval[int(i * step_sz)] for i in range(args.max_eval_samples)]
+    else:
+        eval_samples = raw_eval
     random.Random(42).shuffle(all_train)
     needed = min(len(all_train), args.max_steps * args.gradient_accumulation_steps) if args.max_steps > 0 else len(all_train)
     active_train = all_train[:needed]
@@ -368,6 +435,16 @@ def main() -> int:
                 f"    [yellow][Eval @ Step {step:02d}][/yellow] eval_loss=[bold green]{ev['eval_loss']:.4f}[/bold green] | "
                 f"margin=[bold green]{ev['rewards/margins']:+.4f}[/bold green] | acc=[bold green]{ev['rewards/accuracies']:.4f}[/bold green]"
             )
+        if args.save_steps > 0 and step % args.save_steps == 0 and step < total_steps:
+            ckpt_dir = output_dir / f"checkpoint-{step}"
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(str(ckpt_dir))
+            existing = sorted(
+                output_dir.glob("checkpoint-*"),
+                key=lambda p: int(p.name.split("-")[-1]) if p.name.split("-")[-1].isdigit() else -1,
+            )
+            for old_ckpt in existing[:-2]:
+                shutil.rmtree(old_ckpt, ignore_errors=True)
 
     post_eval = eval_history[-1]
     final_adapter_dir = output_dir / "final_adapter"

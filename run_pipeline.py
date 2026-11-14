@@ -111,7 +111,11 @@ def build_stage_commands(args: argparse.Namespace) -> list[tuple[str, list[str]]
         min(4096, t_cfg["max_seq_len"]) if is_26b else t_cfg["max_seq_len"]
     )
     sft_lr, dpo_lr = ("1e-4", "2e-5") if use_4bit else ("2e-4", "5e-5")
-    grad_accum = "16" if use_4bit else "8"
+    pack_sequences = not bool(getattr(args, "no_pack_sequences", False))
+    if pack_sequences:
+        grad_accum = "4" if use_4bit else "2"
+    else:
+        grad_accum = "16" if use_4bit else "8"
 
     shared_train: list[str] = ["--tier", args.tier, "--model-id", args.model_id, "--data-dir", data_dir]
     if adapter_name:
@@ -134,29 +138,33 @@ def build_stage_commands(args: argparse.Namespace) -> list[tuple[str, list[str]]
                 cmd.extend(["--oss-corpus-root", args.oss_corpus_root])
             plan.append(("data", cmd))
         elif stage == "sft":
-            plan.append(
-                (
-                    "sft",
-                    [
-                        py, "train/sft_lora.py", *shared_train,
-                        "--max-seq-length", str(seq_len), "--max-steps", str(sft_steps),
-                        "--eval-steps", str(sft_eval_steps),
-                        "--learning-rate", sft_lr, "--gradient-accumulation-steps", grad_accum,
-                    ],
-                )
-            )
+            sft_cmd = [
+                py, "train/sft_lora.py", *shared_train,
+                "--max-seq-length", str(seq_len), "--max-steps", str(sft_steps),
+                "--eval-steps", str(sft_eval_steps),
+                "--learning-rate", sft_lr, "--gradient-accumulation-steps", grad_accum,
+            ]
+            if pack_sequences:
+                sft_cmd.append("--pack-sequences")
+            if args.tier in ("dev", "full"):
+                sft_cmd.extend(["--max-eval-samples", "400"])
+            if args.tier == "full":
+                sft_cmd.extend(["--save-steps", "200"])
+            if getattr(args, "resume", False):
+                sft_cmd.extend(["--resume-from-checkpoint", "auto"])
+            plan.append(("sft", sft_cmd))
         elif stage == "dpo":
-            plan.append(
-                (
-                    "dpo",
-                    [
-                        py, "train/dpo_compiler.py", *shared_train,
-                        "--max-seq-length", str(seq_len), "--max-steps", str(dpo_steps),
-                        "--eval-steps", str(dpo_eval_steps),
-                        "--learning-rate", dpo_lr,
-                    ],
-                )
-            )
+            dpo_cmd = [
+                py, "train/dpo_compiler.py", *shared_train,
+                "--max-seq-length", str(seq_len), "--max-steps", str(dpo_steps),
+                "--eval-steps", str(dpo_eval_steps),
+                "--learning-rate", dpo_lr,
+            ]
+            if args.tier in ("dev", "full"):
+                dpo_cmd.extend(["--max-eval-samples", "200"])
+            if args.tier == "full":
+                dpo_cmd.extend(["--save-steps", "200"])
+            plan.append(("dpo", dpo_cmd))
         elif stage == "grpo":
             plan.append(
                 (
@@ -197,6 +205,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dpo-eval-steps", type=int, default=None, help="Override DPO validation cadence in global steps.")
     parser.add_argument("--grpo-steps", type=int, default=None, help="Override GRPO max_steps.")
     parser.add_argument("--max-seq-length", type=int, default=None, help="Override max sequence length.")
+    parser.add_argument("--no-pack-sequences", action="store_true", help="Disable SFT sequence packing.")
+    parser.add_argument("--resume", action="store_true", help="Auto-resume SFT from latest checkpoint in output_dir.")
     parser.add_argument("--dry-run", action="store_true", help="Print stage execution plan without running.")
     return parser.parse_args(argv)
 

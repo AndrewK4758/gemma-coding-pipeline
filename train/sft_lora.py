@@ -10,9 +10,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass
@@ -103,6 +105,80 @@ class ParquetSftDataset(Dataset):
         return self.samples[idx]
 
 
+def select_uniform_stride(samples: list[dict[str, list[int]]], limit: int) -> list[dict[str, list[int]]]:
+    """Deterministically subsample across sorted/grouped datasets preserving proportional language coverage."""
+    if limit <= 0 or len(samples) <= limit:
+        return list(samples)
+    step = len(samples) / float(limit)
+    return [samples[int(i * step)] for i in range(limit)]
+
+
+def pack_sft_samples(
+    samples: list[dict[str, list[int]]],
+    max_seq_length: int,
+    seed: int = 42,
+) -> list[dict[str, list[int]]]:
+    """Pack multiple SFT examples up to `max_seq_length` using Best-Fit Decreasing with resetting `position_ids`."""
+    if not samples:
+        return []
+    rng = random.Random(seed)
+    indexed = [(idx, min(len(sample["input_ids"]), max_seq_length)) for idx, sample in enumerate(samples) if sample["input_ids"]]
+    rng.shuffle(indexed)
+    indexed.sort(key=lambda item: item[1], reverse=True)
+    min_len = indexed[-1][1]
+
+    bins: list[list[int]] = []
+    open_bins: list[tuple[int, int]] = []
+    for orig_idx, seg_len in indexed:
+        pos = bisect.bisect_left(open_bins, (seg_len, -1))
+        if pos < len(open_bins):
+            rem, bin_idx = open_bins.pop(pos)
+            bins[bin_idx].append(orig_idx)
+            new_rem = rem - seg_len
+        else:
+            bin_idx = len(bins)
+            bins.append([orig_idx])
+            new_rem = max_seq_length - seg_len
+        if new_rem >= min_len:
+            bisect.insort(open_bins, (new_rem, bin_idx))
+
+    packed: list[dict[str, list[int]]] = []
+    for bin_indices in bins:
+        if len(bin_indices) > 1:
+            rng.shuffle(bin_indices)
+        p_ids: list[int] = []
+        p_pos: list[int] = []
+        p_lbl: list[int] = []
+        for seg_idx, orig_idx in enumerate(bin_indices):
+            sample = samples[orig_idx]
+            seg_ids = sample["input_ids"][:max_seq_length]
+            seg_lbl = list(sample["labels"][:max_seq_length])
+            if seg_idx > 0 and seg_lbl:
+                # Guarantee zero cross-document loss across the sequence boundary shift (shift_y = labels[:, 1:])
+                seg_lbl[0] = -100
+            p_ids.extend(seg_ids)
+            p_pos.extend(range(len(seg_ids)))
+            p_lbl.extend(seg_lbl)
+        packed.append({"input_ids": p_ids, "position_ids": p_pos, "labels": p_lbl})
+
+    # Shuffle packed bin order so long-only bins and multi-doc bins interleave during training
+    rng.shuffle(packed)
+    return packed
+
+
+class _InMemorySftDataset(Dataset):
+    """Lightweight dataset wrapper over pre-packed or subsampled SFT sample dicts."""
+
+    def __init__(self, samples: list[dict[str, list[int]]]) -> None:
+        self.samples = samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict[str, list[int]]:
+        return self.samples[idx]
+
+
 @dataclass
 class SftCodingDataCollator:
     """Dynamic batch collator that right-pads sequences to a multiple of 8 for Tensor Core MMA alignment."""
@@ -115,21 +191,31 @@ class SftCodingDataCollator:
         if self.pad_to_multiple_of > 1 and max_len % self.pad_to_multiple_of != 0:
             max_len = ((max_len // self.pad_to_multiple_of) + 1) * self.pad_to_multiple_of
 
+        has_packed_pos = "position_ids" in features[0]
         batch_input_ids: list[list[int]] = []
         batch_attention_mask: list[list[int]] = []
+        batch_position_ids: list[list[int]] = []
         batch_labels: list[list[int]] = []
 
         for feat in features:
             pad_len = max_len - len(feat["input_ids"])
             batch_input_ids.append(feat["input_ids"] + [self.pad_token_id] * pad_len)
-            batch_attention_mask.append(feat["attention_mask"] + [0] * pad_len)
             batch_labels.append(feat["labels"] + [-100] * pad_len)
+            if has_packed_pos:
+                batch_position_ids.append(feat["position_ids"] + [0] * pad_len)
+            else:
+                batch_attention_mask.append(feat["attention_mask"] + [0] * pad_len)
 
-        return {
+        batch: dict[str, torch.Tensor] = {
             "input_ids": torch.tensor(batch_input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(batch_attention_mask, dtype=torch.long),
             "labels": torch.tensor(batch_labels, dtype=torch.long),
         }
+        if has_packed_pos:
+            # Omit attention_mask so transformers.masking_utils infers block-diagonal boundaries from position_ids
+            batch["position_ids"] = torch.tensor(batch_position_ids, dtype=torch.long)
+        else:
+            batch["attention_mask"] = torch.tensor(batch_attention_mask, dtype=torch.long)
+        return batch
 
 
 class DualGpuTelemetryCallback(TrainerCallback):
@@ -213,8 +299,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-train-epochs", type=float, default=1.0, help="Number of training epochs when max-steps=-1.")
     parser.add_argument("--learning-rate", type=float, default=2e-4, help="Peak learning rate.")
     parser.add_argument("--per-device-train-batch-size", type=int, default=1, help="Micro-batch size per pass.")
+    parser.add_argument("--per-device-eval-batch-size", type=int, default=4, help="Eval micro-batch size when unpacked.")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8, help="Gradient accumulation steps.")
     parser.add_argument("--eval-steps", type=int, default=5, help="Evaluation frequency in global steps.")
+    parser.add_argument("--max-eval-samples", type=int, default=0, help="Subsample mid-run SFT eval split if > 0 (0=all).")
+    parser.add_argument("--pack-sequences", action="store_true", help="Pack sequences up to max_seq_length with block-diagonal attention.")
+    parser.add_argument("--save-steps", type=int, default=0, help="Checkpoint interval in global steps (0=save only at end).")
+    parser.add_argument("--save-total-limit", type=int, default=2, help="Maximum intermediate checkpoints retained on disk.")
+    parser.add_argument("--resume-from-checkpoint", default=None, help="Checkpoint path or 'auto' to resume latest in output_dir.")
     parser.add_argument("--lora-r", type=int, default=32, help="LoRA rank r.")
     parser.add_argument("--lora-alpha", type=int, default=64, help="LoRA scaling alpha.")
     parser.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout probability.")
@@ -246,22 +338,52 @@ def main() -> int:
     )
 
     data_dir = Path(args.data_dir) if args.data_dir else (REPO_ROOT / "data" / "processed" / args.tier)
-    train_dataset = ParquetSftDataset(data_dir / "sft_train.parquet", tokenizer, max_seq_length=args.max_seq_length)
-    eval_dataset = ParquetSftDataset(data_dir / "sft_eval.parquet", tokenizer, max_seq_length=args.max_seq_length)
+    raw_train_ds = ParquetSftDataset(data_dir / "sft_train.parquet", tokenizer, max_seq_length=args.max_seq_length)
+    raw_eval_ds = ParquetSftDataset(data_dir / "sft_eval.parquet", tokenizer, max_seq_length=args.max_seq_length)
+    eval_samples = select_uniform_stride(raw_eval_ds.samples, args.max_eval_samples)
+    if args.pack_sequences:
+        packed_train = pack_sft_samples(raw_train_ds.samples, max_seq_length=args.max_seq_length, seed=42)
+        packed_eval = pack_sft_samples(eval_samples, max_seq_length=args.max_seq_length, seed=43)
+        train_dataset: Dataset = _InMemorySftDataset(packed_train)
+        eval_dataset: Dataset = _InMemorySftDataset(packed_eval)
+        eval_bs = 1
+        pack_msg = (
+            f" | packed train={len(train_dataset)} bins ({len(raw_train_ds)/max(len(train_dataset), 1):.2f}x), "
+            f"eval={len(eval_dataset)} bins"
+        )
+    else:
+        train_dataset = raw_train_ds
+        eval_dataset = _InMemorySftDataset(eval_samples)
+        eval_bs = max(1, int(args.per_device_eval_batch_size))
+        pack_msg = ""
+
     collator = SftCodingDataCollator(pad_token_id=int(tokenizer.pad_token_id or 0), pad_to_multiple_of=8)
+    model.config.use_cache = False
 
     console.print(
-        f"[bold]Loaded Parquet splits:[/bold] train=[green]{len(train_dataset)}[/green] rows, "
-        f"eval=[green]{len(eval_dataset)}[/green] rows (max_seq_length={args.max_seq_length})"
+        f"[bold]Loaded Parquet splits:[/bold] train=[green]{len(raw_train_ds)}[/green] rows, "
+        f"eval=[green]{len(eval_samples)}/{len(raw_eval_ds)}[/green] rows (max_seq_length={args.max_seq_length}{pack_msg})"
     )
 
     tb_writer = SummaryWriter(log_dir=str(logging_dir))
     telemetry_cb = DualGpuTelemetryCallback(console=console, tb_writer=tb_writer)
 
+    resume_ckpt: str | None = None
+    if args.resume_from_checkpoint == "auto":
+        ckpts = sorted(
+            output_dir.glob("checkpoint-*"),
+            key=lambda p: int(p.name.split("-")[-1]) if p.name.split("-")[-1].isdigit() else -1,
+        )
+        if ckpts:
+            resume_ckpt = str(ckpts[-1])
+    elif args.resume_from_checkpoint:
+        resume_ckpt = str(args.resume_from_checkpoint)
+
+    save_strategy = "steps" if args.save_steps > 0 else "no"
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=1,
+        per_device_eval_batch_size=eval_bs,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_steps=args.max_steps,
         num_train_epochs=args.num_train_epochs,
@@ -276,7 +398,9 @@ def main() -> int:
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         prediction_loss_only=True,
-        save_strategy="no",
+        save_strategy=save_strategy,
+        save_steps=max(1, int(args.save_steps)) if args.save_steps > 0 else 500,
+        save_total_limit=max(1, int(args.save_total_limit)),
         report_to=["tensorboard"],
         remove_unused_columns=False,
         dataloader_pin_memory=True,
@@ -292,14 +416,19 @@ def main() -> int:
         callbacks=[telemetry_cb],
     )
 
-    console.print("[bold yellow]Running baseline pre-train evaluation on held-out eval split...[/bold yellow]")
-    pre_eval = trainer.evaluate()
-    pre_eval_loss = float(pre_eval["eval_loss"])
-    pre_eval_ppl = math.exp(min(pre_eval_loss, 20.0))
-    console.print(f"    Pre-train eval_loss = [bold]{pre_eval_loss:.4f}[/bold] (perplexity = {pre_eval_ppl:.2f})")
+    if resume_ckpt is None:
+        console.print("[bold yellow]Running baseline pre-train evaluation on held-out eval split...[/bold yellow]")
+        pre_eval = trainer.evaluate()
+        pre_eval_loss = float(pre_eval["eval_loss"])
+        pre_eval_ppl = math.exp(min(pre_eval_loss, 20.0))
+        console.print(f"    Pre-train eval_loss = [bold]{pre_eval_loss:.4f}[/bold] (perplexity = {pre_eval_ppl:.2f})")
+    else:
+        pre_eval_loss = 0.0
+        pre_eval_ppl = 1.0
+        console.print(f"[bold yellow]Resuming SFT training from checkpoint: {resume_ckpt}[/bold yellow]")
 
     console.print("[bold green]Starting dual-GPU bfloat16 LoRA SFT training loop...[/bold green]")
-    train_result = trainer.train()
+    train_result = trainer.train(resume_from_checkpoint=resume_ckpt)
 
     console.print("[bold yellow]Running post-train evaluation on held-out eval split...[/bold yellow]")
     post_eval = trainer.evaluate()

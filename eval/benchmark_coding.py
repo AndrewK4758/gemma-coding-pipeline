@@ -41,7 +41,7 @@ if str(REPO_ROOT) not in sys.path:
 from data.build_dataset import SYSTEM_PREAMBLE, resolve_processed_dir
 from data.compiler_sandbox import verify_code_sample
 from eval.held_out_prompts import HELD_OUT_CODING_SUITE
-from train.dpo_compiler import _encode_padded_tensors, compute_chunked_sequence_logps, load_dpo_split
+from train.dpo_compiler import _encode_padded_tensors, compute_batched_sequence_logps, load_dpo_split
 from train.model_loader import (
     DEFAULT_MODEL_ID,
     get_input_device,
@@ -84,11 +84,18 @@ def evaluate_sft_perplexity(
     lang_nll: dict[str, float] = defaultdict(float)
     lang_tokens: dict[str, float] = defaultdict(float)
 
-    for row in sft_rows:
+    encoded_items = [
+        _encode_padded_tensors(row["instruction"], row["response"], tokenizer, max_seq_length)
+        for row in sft_rows
+    ]
+    logp_results = compute_batched_sequence_logps(
+        model,
+        encoded_items,
+        pad_token_id=int(tokenizer.pad_token_id or 0),
+    )
+    for row, (seq_logp, tok_cnt) in zip(sft_rows, logp_results):
         lang = str(row.get("language", "typescript"))
-        ids_t, mask_t, lbls_t = _encode_padded_tensors(row["instruction"], row["response"], tokenizer, max_seq_length)
-        seq_logp, tok_cnt = compute_chunked_sequence_logps(model, ids_t, mask_t, lbls_t)
-        nll, cnt = float(-seq_logp.item()), float(tok_cnt.item())
+        nll, cnt = float(-seq_logp), float(tok_cnt)
         total_nll += nll
         total_tokens += cnt
         lang_nll[lang] += nll
@@ -123,12 +130,15 @@ def evaluate_compiler_preference(
     raw_margins, norm_margins, norm_wins, dpo_margins, dpo_wins = [], [], [], [], []
     lang_wins: dict[str, list[float]] = defaultdict(list)
 
-    for s in dpo_samples:
+    pad_id = int(getattr(getattr(model, "config", None), "pad_token_id", 0) or 0)
+    chosen_items = [(s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"]) for s in dpo_samples]
+    rejected_items = [(s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"]) for s in dpo_samples]
+    chosen_res = compute_batched_sequence_logps(model, chosen_items, pad_token_id=pad_id)
+    rejected_res = compute_batched_sequence_logps(model, rejected_items, pad_token_id=pad_id)
+
+    for s, (c_lp, c_cnt), (r_lp, r_cnt) in zip(dpo_samples, chosen_res, rejected_res):
         sid, lang = str(s["id"]), str(s["language"])
-        c_lp_t, c_cnt_t = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
-        r_lp_t, r_cnt_t = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
-        c_lp, r_lp = float(c_lp_t.item()), float(r_lp_t.item())
-        c_norm, r_norm = c_lp / float(c_cnt_t.item()), r_lp / float(r_cnt_t.item())
+        c_norm, r_norm = c_lp / max(c_cnt, 1.0), r_lp / max(r_cnt, 1.0)
         recorded_logps[sid] = (c_lp, r_lp)
 
         raw_m, norm_m = c_lp - r_lp, c_norm - r_norm

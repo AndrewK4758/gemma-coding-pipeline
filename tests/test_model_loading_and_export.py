@@ -435,6 +435,117 @@ class TestModelLoadingAndExport(unittest.TestCase):
         self.assertGreaterEqual(inspect.signature(bc.evaluate_live_compile_pass_at_1).parameters["max_new_tokens"].default, 512)
         self.assertGreaterEqual(inspect.signature(go.generate_group_completions).parameters["max_new_tokens"].default, 384)
 
+    def test_grouped_moe_parity_with_checkpoint_and_sentinels(self) -> None:
+        import bitsandbytes.functional as F_bnb
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from train.moe_quant import QuantizedGemma4Experts4bit
+
+        devices = ["cpu"] + (["cuda:0"] if torch.cuda.is_available() else [])
+        for dev_str in devices:
+            dev = torch.device(dev_str)
+            torch.manual_seed(17)
+            e_cnt, h_dim, i_dim, t_cnt, k_cnt = 8, 64, 64, 13, 3
+            gu_w = torch.randn(e_cnt, 2 * i_dim, h_dim, dtype=torch.bfloat16, device=dev) * 0.05
+            dn_w = torch.randn(e_cnt, h_dim, i_dim, dtype=torch.bfloat16, device=dev) * 0.05
+            act = nn.GELU(approximate="tanh")
+            qmod = QuantizedGemma4Experts4bit(e_cnt, act, gu_w, dn_w, target_device=dev)
+
+            w_gu_ref = F_bnb.dequantize_4bit(qmod.gate_up_q, qmod._gate_up_state).to(torch.bfloat16)
+            w_dn_ref = F_bnb.dequantize_4bit(qmod.down_q, qmod._down_state).to(torch.bfloat16)
+
+            x1 = torch.randn(t_cnt, h_dim, dtype=torch.bfloat16, device=dev, requires_grad=True)
+            w1 = torch.rand(t_cnt, k_cnt, dtype=torch.bfloat16, device=dev, requires_grad=True)
+            idx = torch.randint(0, e_cnt, (t_cnt, k_cnt), device=dev)
+            idx[0, 0] = e_cnt  # sentinel padding slot
+
+            x2 = x1.detach().clone().requires_grad_(True)
+            w2 = w1.detach().clone().requires_grad_(True)
+            ref_out = torch.zeros_like(x2)
+            for tok in range(t_cnt):
+                for slot in range(k_cnt):
+                    ex = int(idx[tok, slot].item())
+                    if ex == e_cnt:
+                        continue
+                    g, u = F.linear(x2[tok : tok + 1], w_gu_ref[ex]).chunk(2, dim=-1)
+                    ref_out[tok] = ref_out[tok] + F.linear(act(g) * u, w_dn_ref[ex]).squeeze(0) * w2[tok, slot]
+
+            out1 = torch.utils.checkpoint.checkpoint(qmod, x1, idx, w1, use_reentrant=False)
+            grad_out = torch.randn_like(out1)
+            out1.backward(grad_out)
+            ref_out.backward(grad_out)
+
+            self.assertLess((out1 - ref_out).abs().max().item(), 2e-2)
+            self.assertLess((x1.grad - x2.grad).abs().max().item(), 2e-2)
+            self.assertLess((w1.grad - w2.grad).abs().max().item(), 2e-2)
+
+    def test_sft_sequence_packing_block_diagonal_and_loss_parity(self) -> None:
+        from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+        from train.model_loader import install_chunked_causal_lm_loss
+        from train.sft_lora import SftCodingDataCollator, pack_sft_samples
+
+        s1 = {"input_ids": [10, 11, 12, 13, 14, 15], "attention_mask": [1] * 6, "labels": [-100, -100, 12, 13, 14, 15]}
+        s2 = {"input_ids": [20, 21, 22, 23, 24], "attention_mask": [1] * 5, "labels": [20, -100, 22, 23, 24]}
+        packed = pack_sft_samples([s1, s2], max_seq_length=16, seed=0)
+        self.assertEqual(len(packed), 1)
+        self.assertEqual(packed[0]["labels"][packed[0]["position_ids"].index(0, 1)], -100)
+
+        collator = SftCodingDataCollator(pad_token_id=0, pad_to_multiple_of=8)
+        batch = collator(packed)
+        self.assertNotIn("attention_mask", batch)
+        self.assertIn("position_ids", batch)
+        self.assertEqual(batch["input_ids"].shape[1] % 8, 0)
+
+        cfg = Gemma4TextConfig(
+            hidden_size=32, intermediate_size=64, num_hidden_layers=2, num_attention_heads=2,
+            num_key_value_heads=1, head_dim=16, global_head_dim=16, vocab_size=64,
+            hidden_size_per_layer_input=0, num_kv_shared_layers=0,
+            layer_types=["sliding_attention", "full_attention"], sliding_window=4, attn_implementation="sdpa",
+        )
+        m = Gemma4ForCausalLM(cfg).to(dtype=torch.bfloat16).eval()
+        install_chunked_causal_lm_loss(m, chunk_size=4)
+        # Verify use_cache=True default does not break block-diagonal packing isolation
+        m.config.use_cache = True
+        with torch.no_grad():
+            o1 = m(input_ids=torch.tensor([s1["input_ids"]]), labels=torch.tensor([s1["labels"]]))
+            # Match pack masking of leading token on 2nd doc
+            l2 = [-100] + s2["labels"][1:]
+            o2 = m(input_ids=torch.tensor([s2["input_ids"]]), labels=torch.tensor([l2]))
+            n1 = sum(1 for x in s1["labels"][1:] if x != -100)
+            n2 = sum(1 for x in l2[1:] if x != -100)
+            ref_loss = (o1.loss.item() * n1 + o2.loss.item() * n2) / (n1 + n2)
+            op = m(input_ids=batch["input_ids"], position_ids=batch["position_ids"], labels=batch["labels"])
+        self.assertLess(abs(ref_loss - float(op.loss.item())), 5e-3)
+
+    def test_batched_sequence_logps_matches_single_item_evaluation(self) -> None:
+        from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+        from train.dpo_compiler import compute_batched_sequence_logps, compute_chunked_sequence_logps
+
+        cfg = Gemma4TextConfig(
+            hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2,
+            num_key_value_heads=1, head_dim=16, global_head_dim=16, vocab_size=64,
+            hidden_size_per_layer_input=0, num_kv_shared_layers=0,
+            layer_types=["full_attention"], attn_implementation="sdpa",
+        )
+        torch.manual_seed(9)
+        m = Gemma4ForCausalLM(cfg).to(dtype=torch.bfloat16).eval()
+        items = []
+        for length in (9, 15, 11, 21, 7):
+            ids = torch.randint(4, 60, (1, length), dtype=torch.long)
+            mask = torch.ones_like(ids)
+            lbls = ids.clone()
+            lbls[0, : length // 2] = -100
+            items.append((ids, mask, lbls))
+
+        with torch.no_grad():
+            singles = [tuple(float(t.item()) for t in compute_chunked_sequence_logps(m, *it)) for it in items]
+            batched = compute_batched_sequence_logps(m, items, pad_token_id=0, max_batch_tokens=64, max_batch_size=4)
+
+        self.assertEqual(len(singles), len(batched))
+        for (s_lp, s_cnt), (b_lp, b_cnt) in zip(singles, batched):
+            self.assertEqual(s_cnt, b_cnt)
+            self.assertAlmostEqual(s_lp, b_lp, delta=5e-2)
+
 
 if __name__ == "__main__":
     unittest.main()
