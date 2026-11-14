@@ -343,6 +343,106 @@ class TestGoCppPipeline(unittest.TestCase):
             self.assertAlmostEqual(ev["logps/chosen"], -1.0, places=5)
             self.assertAlmostEqual(ev["rewards/margins"], 0.0, places=5)
 
+    def test_stratified_train_eval_split_prioritizes_passed_and_balances_languages(self) -> None:
+        from collections import Counter
+        from data.build_dataset import _stratified_train_eval_split
+
+        langs = ("typescript", "go", "csharp", "cpp")
+        passed = [
+            {
+                "id": f"p_{lang}_{i}",
+                "language": lang,
+                "source": "oss_commit" if i % 2 == 0 else "local_projects",
+                "compiler_passed": True,
+            }
+            for lang in langs
+            for i in range(15)
+        ]
+        failed = [
+            {
+                "id": f"f_{lang}_{i}",
+                "language": lang,
+                "source": "codefeedback_magicoder",
+                "compiler_passed": False,
+            }
+            for lang in langs
+            for i in range(10)
+        ]
+        train_sft, eval_sft = _stratified_train_eval_split(
+            passed + failed, eval_fraction=0.10, prefer_passed_eval=True, seed=42
+        )
+        self.assertEqual(len(eval_sft), 10)
+        self.assertEqual(len(train_sft), 90)
+        self.assertTrue(all(r["compiler_passed"] for r in eval_sft))
+        sft_lang_counts = Counter(r["language"] for r in eval_sft)
+        self.assertEqual(set(sft_lang_counts.keys()), set(langs))
+        self.assertTrue(all(v >= 2 for v in sft_lang_counts.values()))
+
+        # DPO split should stratify even when rows are grouped sequentially by language
+        dpo_grouped = [{"id": f"d_{lang}_{i}", "language": lang, "source": "oss_diff"} for lang in langs for i in range(20)]
+        train_dpo, eval_dpo = _stratified_train_eval_split(
+            dpo_grouped, eval_fraction=0.10, prefer_passed_eval=False, seed=42
+        )
+        self.assertEqual(len(eval_dpo), 8)
+        self.assertEqual(len(train_dpo), 72)
+        self.assertEqual(dict(Counter(r["language"] for r in eval_dpo)), {lang: 2 for lang in langs})
+
+        single = [{"id": "only_1", "language": "go", "source": "local_projects", "compiler_passed": True}]
+        s_tr, s_ev = _stratified_train_eval_split(single, eval_fraction=0.10, prefer_passed_eval=True)
+        self.assertEqual((len(s_tr), len(s_ev)), (1, 1))
+
+    def test_ingest_single_domain_scales_quota_for_one_language(self) -> None:
+        from unittest import mock
+        from data import ingest_sources
+
+        seen_quotas: list[int] = []
+
+        def _fake_stream(quota: int, *_args: object) -> list[dict[str, object]]:
+            seen_quotas.append(quota)
+            return [
+                {"id": f"go_{quota}", "language": "go", "instruction": f"go prompt {quota}"},
+                {"id": f"ts_{quota}", "language": "typescript", "instruction": f"ts prompt {quota}"},
+            ]
+
+        with (
+            mock.patch.object(ingest_sources, "_discover_local_source_files", return_value={}),
+            mock.patch.object(ingest_sources, "stream_codefeedback_magicoder", side_effect=_fake_stream),
+            mock.patch.object(ingest_sources, "stream_commitpack_diffs", side_effect=lambda q: seen_quotas.append(q) or []),
+            mock.patch.object(ingest_sources, "stream_arch_explanations", side_effect=_fake_stream),
+            mock.patch.object(ingest_sources, "harvest_local_projects", side_effect=_fake_stream),
+            mock.patch("data.mine_oss_repos.load_oss_records", return_value=[]),
+        ):
+            go_rows = ingest_sources.ingest_all_sources(1000, domain="go", oss_only=False)
+            go_quotas = list(seen_quotas)
+            seen_quotas.clear()
+            all_rows = ingest_sources.ingest_all_sources(1000, domain="all", oss_only=False)
+            all_quotas = list(seen_quotas)
+
+        self.assertEqual(go_quotas, [355, 355, 355, 355])
+        self.assertEqual(all_quotas, [92, 92, 92, 92])
+        self.assertTrue(go_rows and all(r["language"] == "go" for r in go_rows))
+        self.assertEqual({r["language"] for r in all_rows}, {"go", "typescript"})
+
+    def test_interleave_grpo_prompts_by_language_rotates_all_languages(self) -> None:
+        from collections import Counter
+        from train.grpo_online import interleave_grpo_prompts_by_language
+
+        rows = (
+            [{"id": f"cs_{i}", "language": "csharp"} for i in range(40)]
+            + [{"id": f"ts_{i}", "language": "typescript"} for i in range(10)]
+            + [{"id": f"go_{i}", "language": "go"} for i in range(10)]
+            + [{"id": f"cp_{i}", "language": "cpp"} for i in range(10)]
+        )
+        mixed = interleave_grpo_prompts_by_language(rows, seed=42)
+        self.assertEqual(len(mixed), len(rows))
+        self.assertEqual([r["language"] for r in mixed[:4]], ["typescript", "go", "csharp", "cpp"])
+        first_40 = Counter(r["language"] for r in mixed[:40])
+        self.assertEqual(dict(first_40), {"typescript": 10, "go": 10, "csharp": 10, "cpp": 10})
+        self.assertEqual(interleave_grpo_prompts_by_language(rows, seed=42), mixed)
+
+        ordered = interleave_grpo_prompts_by_language(rows, seed=42, preserve_order_within_language=True)
+        self.assertEqual([r["id"] for r in ordered[:4]], ["ts_0", "go_0", "cs_0", "cp_0"])
+
 
 if __name__ == "__main__":
     unittest.main()

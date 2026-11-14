@@ -18,9 +18,11 @@ import argparse
 import concurrent.futures
 import json
 import os
+import random
 import statistics
 import sys
 import time
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 
@@ -200,6 +202,36 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def interleave_grpo_prompts_by_language(
+    rows: list[dict[str, Any]],
+    seed: int = 42,
+    preserve_order_within_language: bool = False,
+) -> list[dict[str, Any]]:
+    """Shuffle prompts within each language and round-robin interleave across languages."""
+    if len(rows) <= 1:
+        return list(rows)
+    rng = random.Random(seed)
+    by_lang: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_lang[str(row.get("language", "unknown"))].append(row)
+    preferred_order = ("typescript", "go", "csharp", "cpp")
+    lang_order = [lang for lang in preferred_order if lang in by_lang]
+    lang_order.extend(sorted(lang for lang in by_lang if lang not in preferred_order))
+    queues: list[deque[dict[str, Any]]] = []
+    for lang in lang_order:
+        bucket = list(by_lang[lang])
+        if not preserve_order_within_language:
+            rng.shuffle(bucket)
+        queues.append(deque(bucket))
+
+    interleaved: list[dict[str, Any]] = []
+    while any(queues):
+        for q in queues:
+            if q:
+                interleaved.append(q.popleft())
+    return interleaved
+
+
 def main() -> int:
     args = parse_args()
     if args.smoke_test:
@@ -229,10 +261,16 @@ def main() -> int:
     grpo_parquet = data_dir / "grpo_tasks.parquet"
     grpo_rows = pq.read_table(grpo_parquet).to_pylist() if grpo_parquet.exists() else []
     if grpo_rows:
-        prompt_pool = grpo_rows
+        prompt_pool = interleave_grpo_prompts_by_language(grpo_rows, seed=42)
     else:
         raw_rows = pq.read_table(data_dir / "dpo_train.parquet").to_pylist()
-        prompt_pool = sorted(raw_rows, key=lambda r: len(r["chosen"]))
+        prompt_pool = interleave_grpo_prompts_by_language(
+            sorted(raw_rows, key=lambda r: len(r["chosen"])),
+            seed=42,
+            preserve_order_within_language=True,
+        )
+    if not prompt_pool:
+        raise RuntimeError(f"No GRPO tasks or DPO prompts found in {data_dir}")
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = bnb.optim.PagedAdamW8bit(trainable_params, lr=args.learning_rate, weight_decay=0.01)
     tb_writer = SummaryWriter(log_dir=str(logging_dir))

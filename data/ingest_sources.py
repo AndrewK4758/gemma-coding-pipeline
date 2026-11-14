@@ -358,14 +358,15 @@ def ingest_all_sources(
     """Ingest balanced records across general sources and/or mined .NET & React OSS commits."""
     records: list[dict[str, Any]] = []
     if not oss_only and domain != "oss":
-        per_source_lang_quota = max(30, int((target_sft_rows * 1.4) / (4 * len(TARGET_LANGUAGES))) + 5)
+        lang_gate = {"dotnet": "csharp", "react": "typescript", "go": "go", "cpp": "cpp"}.get(domain)
+        active_langs = 1 if lang_gate else len(TARGET_LANGUAGES)
+        per_source_lang_quota = max(30, int((target_sft_rows * 1.4) / (4 * active_langs)) + 5)
         local_files = _discover_local_source_files()
         general: list[dict[str, Any]] = []
         general.extend(stream_codefeedback_magicoder(per_source_lang_quota, local_files))
         general.extend(stream_commitpack_diffs(per_source_lang_quota))
         general.extend(stream_arch_explanations(per_source_lang_quota, local_files))
         general.extend(harvest_local_projects(per_source_lang_quota, local_files))
-        lang_gate = {"dotnet": "csharp", "react": "typescript", "go": "go", "cpp": "cpp"}.get(domain)
         records.extend([r for r in general if not lang_gate or r.get("language") == lang_gate])
     if domain in {"all", "oss", "dotnet", "react", "go", "cpp"}:
         from data.mine_oss_repos import load_oss_records

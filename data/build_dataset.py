@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import statistics
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -184,6 +185,53 @@ def _select_balanced_sft_records(
     return selected[:target_count]
 
 
+def _stratified_train_eval_split(
+    rows: list[dict[str, Any]],
+    eval_fraction: float = 0.10,
+    prefer_passed_eval: bool = False,
+    seed: int = 42,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Deterministically shuffle and split rows with proportional (language, source) stratification."""
+    if len(rows) <= 1:
+        return list(rows), list(rows)
+    eval_n = max(1, min(len(rows) - 1, int(len(rows) * eval_fraction)))
+    rng = random.Random(seed)
+    candidates = [r for r in rows if r.get("compiler_passed", True)] if prefer_passed_eval else list(rows)
+    fallback_rows = [r for r in rows if not r.get("compiler_passed", True)] if prefer_passed_eval else []
+    if len(candidates) < eval_n:
+        candidates = list(rows)
+        fallback_rows = []
+
+    strata: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in candidates:
+        strata[(str(row.get("language", "")), str(row.get("source", "")))].append(row)
+    for bucket in strata.values():
+        rng.shuffle(bucket)
+
+    total = len(candidates)
+    exact_quotas = {k: (len(bucket) * eval_n) / total for k, bucket in strata.items()}
+    eval_counts = {k: int(q) for k, q in exact_quotas.items()}
+    remainder = eval_n - sum(eval_counts.values())
+    for k in sorted(exact_quotas, key=lambda key: (-(exact_quotas[key] - eval_counts[key]), key)):
+        if remainder <= 0:
+            break
+        if eval_counts[k] < len(strata[k]):
+            eval_counts[k] += 1
+            remainder -= 1
+
+    eval_rows: list[dict[str, Any]] = []
+    train_rows: list[dict[str, Any]] = list(fallback_rows)
+    for k in sorted(strata):
+        bucket = strata[k]
+        take = eval_counts[k]
+        eval_rows.extend(bucket[:take])
+        train_rows.extend(bucket[take:])
+
+    rng.shuffle(train_rows)
+    rng.shuffle(eval_rows)
+    return train_rows, eval_rows
+
+
 def _inspect_masked_sample(sample: dict[str, Any], tokenizer: PreTrainedTokenizerBase) -> dict[str, Any]:
     """Summarize the -100 -> valid token ID transition boundary."""
     input_ids, labels, boundary = sample["input_ids"], sample["labels"], sample["prompt_token_count"]
@@ -296,10 +344,12 @@ def build_dataset_for_tier(
         for g in grpo_raw
     ]
 
-    sft_eval_n = max(1, int(len(tokenized_sft) * 0.10)) if len(tokenized_sft) > 1 else 0
-    sft_train_rows, sft_eval_rows = (tokenized_sft[:-sft_eval_n], tokenized_sft[-sft_eval_n:]) if sft_eval_n else (tokenized_sft, tokenized_sft)
-    dpo_eval_n = max(1, int(len(dpo_rows) * 0.10)) if len(dpo_rows) > 1 else 0
-    dpo_train_rows, dpo_eval_rows = (dpo_rows[:-dpo_eval_n], dpo_rows[-dpo_eval_n:]) if dpo_eval_n else (dpo_rows, dpo_rows)
+    sft_train_rows, sft_eval_rows = _stratified_train_eval_split(
+        tokenized_sft, eval_fraction=0.10, prefer_passed_eval=True, seed=42
+    )
+    dpo_train_rows, dpo_eval_rows = _stratified_train_eval_split(
+        dpo_rows, eval_fraction=0.10, prefer_passed_eval=False, seed=42
+    )
 
     dpo_schema = pa.schema([(k, pa.string()) for k in ("id", "source", "language", "record_type", "domain", "prompt", "chosen", "rejected", "compiler_toolchain", "compiler_feedback", "prompt_chatml", "chosen_chatml", "rejected_chatml")])
     grpo_schema = pa.schema([("id", pa.string()), ("source", pa.string()), ("record_type", pa.string()), ("domain", pa.string()), ("ecosystem", pa.string()), ("language", pa.string()), ("repo_name", pa.string()), ("repo_path", pa.string()), ("parent_sha", pa.string()), ("commit_sha", pa.string()), ("test_files", pa.list_(pa.string())), ("prompt", pa.string()), ("reference_diff", pa.string()), ("prompt_chatml", pa.string())])

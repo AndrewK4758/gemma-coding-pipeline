@@ -12,6 +12,7 @@ MODEL_ID="google/gemma-4-26B-A4B-it"
 STAGES="data,sft,dpo,grpo,eval,export"
 CORPUS_DIR="${OSS_CORPUS_DIR:-}"
 OSS_ONLY=0
+RESUME=0
 DRY_RUN=0
 
 while (( $# > 0 )); do
@@ -40,6 +41,10 @@ while (( $# > 0 )); do
       OSS_ONLY=1
       shift
       ;;
+    --resume)
+      RESUME=1
+      shift
+      ;;
     --dry-run)
       DRY_RUN=1
       shift
@@ -54,6 +59,7 @@ Usage: train_26b_all_languages.zsh [options]
   --stages <csv>                         Stages CSV (default: data,sft,dpo,grpo,eval,export)
   --oss-corpus-root <dir>                Cloned OSS corpus root
   --oss-only                             Restrict unified/per-domain runs to mined OSS repos
+  --resume                               Resume SFT stage from latest checkpoint if available
   --dry-run                              Print planned commands without training
 USAGE
       exit 0
@@ -119,6 +125,9 @@ run_one() {
   )
   if (( use_oss )); then
     cmd+=(--oss-only)
+  fi
+  if (( RESUME )); then
+    cmd+=(--resume)
   fi
   if (( DRY_RUN )); then
     cmd+=(--dry-run)
