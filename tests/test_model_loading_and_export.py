@@ -1,0 +1,440 @@
+"""Regression tests for E4B num_experts=None handling, non-CPU input device resolution, and 26B export isolation."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+import torch
+import torch.nn as nn
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+class _FakeVisionFirstGemma(nn.Module):
+    """Mimics Gemma 4 parameter order where CPU-offloaded vision_tower precedes language_model."""
+
+    def __init__(self, embed_dev: str = "cpu") -> None:
+        super().__init__()
+        self.model = nn.Module()
+        self.model.vision_tower = nn.Linear(4, 4, bias=False)
+        self.model.language_model = nn.Module()
+        self.model.language_model.embed_tokens = nn.Embedding(8, 4)
+        self._embed_dev = embed_dev
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.language_model.embed_tokens
+
+
+class TestModelLoadingAndExport(unittest.TestCase):
+    def test_e4b_num_experts_none_topology_does_not_raise(self) -> None:
+        from train.model_loader import resolve_model_topology
+
+        e4b_text_cfg = SimpleNamespace(num_hidden_layers=42, enable_moe_block=False, num_experts=None)
+        fake_cfg = SimpleNamespace(model_type="gemma4", get_text_config=lambda: e4b_text_cfg)
+        with (
+            mock.patch("train.model_loader.resolve_checkpoint_id", return_value="google/gemma-4-E4B-it"),
+            mock.patch("train.model_loader.AutoConfig.from_pretrained", return_value=fake_cfg),
+        ):
+            topo = resolve_model_topology("google/gemma-4-E4B-it", load_in_4bit=False)
+        self.assertFalse(topo["is_moe"])
+        self.assertEqual(topo["num_layers"], 42)
+        self.assertEqual(topo["split_layer"], 26)
+        self.assertEqual(topo["device_map"]["model.vision_tower"], 1)
+
+    def test_26b_topology_omits_absent_audio_and_ple_keys(self) -> None:
+        from train.model_loader import resolve_model_topology
+
+        moe_text_cfg = SimpleNamespace(
+            num_hidden_layers=30, enable_moe_block=True, num_experts=128, hidden_size_per_layer_input=0
+        )
+        fake_cfg = SimpleNamespace(model_type="gemma4", audio_config=None, get_text_config=lambda: moe_text_cfg)
+        with (
+            mock.patch("train.model_loader.resolve_checkpoint_id", return_value="google/gemma-4-26B-A4B-it"),
+            mock.patch("train.model_loader.AutoConfig.from_pretrained", return_value=fake_cfg),
+        ):
+            topo = resolve_model_topology("google/gemma-4-26B-A4B-it", load_in_4bit=True)
+        self.assertTrue(topo["is_moe"])
+        self.assertNotIn("model.audio_tower", topo["device_map"])
+        self.assertNotIn("model.language_model.embed_tokens_per_layer", topo["device_map"])
+        self.assertNotIn("model.language_model.layers.0", topo["device_map"])
+        self.assertEqual(topo["device_map"]["model.language_model.layers.0.self_attn"], 1)
+        self.assertEqual(topo["device_map"]["model.language_model.layers.22.self_attn"], 0)
+        self.assertEqual(topo["device_map"]["model.language_model.layers.0.experts"], "disk")
+
+    def test_quantize_moe_experts_reads_meta_offloaded_weights_map(self) -> None:
+        from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+        from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+        from train.moe_quant import QuantizedGemma4Experts4bit, quantize_gemma4_moe_experts_in_place
+
+        cfg = Gemma4TextConfig(
+            hidden_size=64, intermediate_size=128, moe_intermediate_size=64, num_hidden_layers=1,
+            num_attention_heads=2, num_key_value_heads=1, head_dim=32, global_head_dim=32,
+            vocab_size=128, enable_moe_block=True, num_experts=4, top_k_experts=2,
+            hidden_size_per_layer_input=0, num_kv_shared_layers=0, layer_types=["full_attention"],
+        )
+        model = Gemma4ForCausalLM(cfg).to(dtype=torch.bfloat16)
+        exp = model.model.layers[0].experts
+        add_hook_to_module(exp, AlignDevicesHook(execution_device="cpu", offload=True))
+        self.assertEqual(exp.gate_up_proj.device.type, "meta")
+        hook = exp._hf_hook
+
+        replaced = quantize_gemma4_moe_experts_in_place(model, layer_device_map={0: "cpu"})
+        self.assertEqual(replaced, 1)
+        q_exp = model.model.layers[0].experts
+        self.assertIsInstance(q_exp, QuantizedGemma4Experts4bit)
+        self.assertEqual(q_exp.gate_up_q_0.device.type, "cpu")
+        self.assertEqual(len(hook.weights_map), 0)
+
+        ids = torch.randint(0, 128, (1, 4))
+        out = model(input_ids=ids, labels=ids)
+        out.loss.backward()
+
+    def test_get_input_device_skips_cpu_offloaded_vision_tower(self) -> None:
+        from train.model_loader import get_input_device
+
+        fake_model = _FakeVisionFirstGemma()
+        with mock.patch.object(fake_model.model.vision_tower, "parameters", return_value=iter([torch.zeros(1)])):
+            dev = get_input_device(fake_model)
+        self.assertEqual(dev, fake_model.get_input_embeddings().weight.device)
+
+        fake_emb = mock.MagicMock()
+        fake_emb.weight = SimpleNamespace(device=torch.device("cuda", 0))
+        fake_model.get_input_embeddings = lambda: fake_emb
+        self.assertEqual(get_input_device(fake_model), torch.device("cuda", 0))
+
+    def test_export_merged_dir_isolates_26b_and_sets_q8_ncmoe(self) -> None:
+        from export.merge_and_quantize_gguf import resolve_export_paths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            e4b_default = resolve_export_paths(root, model_id="google/gemma-4-E4B-it", adapter_name=None)
+            moe_default = resolve_export_paths(root, model_id="google/gemma-4-26B-A4B-it", adapter_name=None)
+            self.assertEqual(e4b_default["merged_dir"], root / "outputs" / "merged-bf16")
+            self.assertEqual(moe_default["merged_dir"], root / "outputs" / "merged-bf16-gemma-4-26B-A4B-coder")
+            self.assertNotEqual(e4b_default["merged_dir"], moe_default["merged_dir"])
+            self.assertEqual(moe_default["q8_extra_gpu_args"], ["-ncmoe", "16"])
+            self.assertEqual(e4b_default["q8_extra_gpu_args"], [])
+
+    def test_train_26b_all_languages_script_dry_run(self) -> None:
+        script = REPO_ROOT / "scripts" / "train_26b_all_languages.zsh"
+        self.assertTrue(script.is_file(), f"Missing runner script: {script}")
+        with tempfile.TemporaryDirectory() as tmp:
+            corpus = Path(tmp) / "training_data"
+            for eco in ("dotnet", "react", "go", "cpp"):
+                (corpus / eco).mkdir(parents=True)
+            env = {**os.environ, "OSS_CORPUS_DIR": str(corpus)}
+            proc = subprocess.run(
+                ["zsh", str(script), "--tier", "smoke", "--mode", "per-domain", "--dry-run"],
+                cwd=str(REPO_ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + "\n" + proc.stderr)
+        combined = proc.stdout + "\n" + proc.stderr
+        for domain in ("dotnet", "react", "go", "cpp"):
+            self.assertIn(domain, combined)
+        self.assertIn("google/gemma-4-26B-A4B-it", combined)
+
+    def test_multigpu_rng_context_fn_preserves_and_restores_all_device_states(self) -> None:
+        from train.model_loader import make_multigpu_rng_context_fn
+
+        fake_states = {0: torch.tensor([10], dtype=torch.uint8), 1: torch.tensor([20], dtype=torch.uint8)}
+
+        def _get(dev="cuda"):
+            return fake_states[int(dev)].clone()
+
+        def _set(st, dev="cuda"):
+            fake_states[int(dev)] = st.clone()
+
+        with (
+            mock.patch("train.model_loader.torch.cuda.is_available", return_value=True),
+            mock.patch("train.model_loader.torch.cuda.device_count", return_value=2),
+            mock.patch("train.model_loader.torch.cuda.get_rng_state", side_effect=_get),
+            mock.patch("train.model_loader.torch.cuda.set_rng_state", side_effect=_set),
+        ):
+            ctx_fn = make_multigpu_rng_context_fn()
+            fwd_ctx, rec_ctx = ctx_fn()
+            with fwd_ctx:
+                fake_states[0] = torch.tensor([99], dtype=torch.uint8)
+                fake_states[1] = torch.tensor([88], dtype=torch.uint8)
+            with rec_ctx:
+                self.assertEqual(int(fake_states[0].item()), 10)
+                self.assertEqual(int(fake_states[1].item()), 20)
+            self.assertEqual(int(fake_states[0].item()), 99)
+            self.assertEqual(int(fake_states[1].item()), 88)
+
+    def test_disk_offload_moe_finalize_hooks_and_clean_hf_device_map(self) -> None:
+        from transformers import AutoModelForCausalLM, Gemma4ForCausalLM, Gemma4TextConfig
+        from train.moe_quant import (
+            _extract_expert_tensor,
+            _release_offload_hooks,
+            finalize_disk_offloaded_moe_layers,
+        )
+
+        cfg = Gemma4TextConfig(
+            hidden_size=64, intermediate_size=128, moe_intermediate_size=64, num_hidden_layers=2,
+            num_attention_heads=2, num_key_value_heads=1, head_dim=32, global_head_dim=32,
+            vocab_size=128, enable_moe_block=True, num_experts=4, top_k_experts=2,
+            hidden_size_per_layer_input=0, num_kv_shared_layers=0, layer_types=["sliding_attention", "full_attention"],
+        )
+        m0 = Gemma4ForCausalLM(cfg).to(dtype=torch.bfloat16)
+        with tempfile.TemporaryDirectory() as ckpt, tempfile.TemporaryDirectory() as off:
+            m0.save_pretrained(ckpt, safe_serialization=True)
+            dmap = {"model.embed_tokens": "cpu", "model.norm": "cpu", "model.rotary_emb": "cpu", "lm_head": "cpu"}
+            for i in range(2):
+                dmap[f"model.layers.{i}.layer_scalar"] = "cpu"
+                for name, _ in m0.model.layers[i].named_children():
+                    dmap[f"model.layers.{i}.{name}"] = "disk" if name == "experts" else "cpu"
+            loaded = AutoModelForCausalLM.from_pretrained(ckpt, dtype=torch.bfloat16, device_map=dmap, offload_folder=off)
+            self.assertEqual(list(Path(off).iterdir()), [])
+            for i in range(2):
+                gu = _extract_expert_tensor(loaded.model.layers[i].experts, "gate_up_proj")
+                self.assertEqual(gu.shape, (4, 128, 64))
+                _release_offload_hooks(loaded.model.layers[i].experts)
+            finalize_disk_offloaded_moe_layers(loaded, layer_device_map={0: "cpu", 1: "cpu"}, prefix="model.layers")
+            self.assertEqual(loaded.hf_device_map["model.layers.0"], "cpu")
+            self.assertNotIn("model.layers.0.layer_scalar", loaded.hf_device_map)
+            self.assertTrue(hasattr(loaded.model.layers[0], "_hf_hook"))
+
+    def test_resolve_base_snapshot_dir_handles_partial_main_revision(self) -> None:
+        from export.merge_and_quantize_gguf import resolve_base_snapshot_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            snaps = Path(tmp) / "snapshots"
+            partial = snaps / "rev_partial"
+            complete = snaps / "rev_complete"
+            partial.mkdir(parents=True)
+            complete.mkdir(parents=True)
+            (partial / "config.json").write_text("{}")
+            (complete / "config.json").write_text("{}")
+            (complete / "model.safetensors").write_text("weights")
+
+            def _fake_cached(repo_id: str, filename: str, local_files_only: bool = False) -> str:
+                if filename == "config.json":
+                    return str(partial / "config.json")
+                raise FileNotFoundError(filename)
+
+            with (
+                mock.patch("export.merge_and_quantize_gguf.cached_file", side_effect=_fake_cached),
+                mock.patch("export.merge_and_quantize_gguf.snapshot_download", side_effect=AssertionError("unexpected call")),
+            ):
+                resolved = resolve_base_snapshot_dir("google/gemma-4-E4B-it")
+            self.assertEqual(resolved, complete)
+
+            index_file = complete / "model.safetensors.index.json"
+            index_file.write_text("{}")
+            with (
+                mock.patch("export.merge_and_quantize_gguf.cached_file", return_value=str(index_file)),
+                mock.patch("export.merge_and_quantize_gguf.snapshot_download", side_effect=AssertionError("unexpected call")),
+            ):
+                self.assertEqual(resolve_base_snapshot_dir("google/gemma-4-26B-A4B-it"), complete)
+
+    def test_load_peft_adapter_preserving_sharding_skips_redispatch_and_preserves_hooks(self) -> None:
+        from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+        from peft import LoraConfig, get_peft_model
+        from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+        from train.model_loader import load_peft_adapter_preserving_sharding
+
+        cfg = Gemma4TextConfig(
+            hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2,
+            num_key_value_heads=1, head_dim=16, global_head_dim=16, vocab_size=64,
+            hidden_size_per_layer_input=0, num_kv_shared_layers=0, layer_types=["full_attention"],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            m_src = Gemma4ForCausalLM(cfg).to(dtype=torch.bfloat16)
+            peft_src = get_peft_model(
+                m_src, LoraConfig(r=4, lora_alpha=8, task_type="CAUSAL_LM", target_modules=["q_proj", "v_proj"])
+            )
+            peft_src.save_pretrained(tmp)
+
+            m_dst = Gemma4ForCausalLM(cfg).to(dtype=torch.bfloat16)
+            add_hook_to_module(m_dst.model.layers[0], AlignDevicesHook(execution_device="cpu", place_submodules=False))
+            orig_hmap = {"model.vision_tower": "cpu", "model.layers.0": "cpu"}
+            m_dst.hf_device_map = dict(orig_hmap)
+
+            with mock.patch("peft.peft_model.dispatch_model", side_effect=AssertionError("must not redispatch")):
+                peft_dst = load_peft_adapter_preserving_sharding(m_dst, tmp, adapter_name="default", is_trainable=True)
+
+            self.assertTrue(hasattr(peft_dst.get_base_model().model.layers[0], "_hf_hook"))
+            self.assertEqual(peft_dst.get_base_model().hf_device_map, orig_hmap)
+            ids = torch.randint(0, 64, (1, 4))
+            peft_dst(input_ids=ids, labels=ids).loss.backward()
+
+    def test_backward_dpo_pair_loss_matches_joint_backward_and_runs_sequentially(self) -> None:
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from train.dpo_compiler import backward_dpo_pair_loss
+
+        torch.manual_seed(0)
+        lin_ref = nn.Linear(4, 1)
+        lin_seq = nn.Linear(4, 1)
+        lin_seq.load_state_dict(lin_ref.state_dict())
+        xc = torch.randn(1, 4)
+        xr = torch.randn(1, 4)
+        beta, grad_accum, ref_c, ref_r = 0.1, 4, -1.25, -2.5
+
+        c_joint = lin_ref(xc).sum()
+        r_joint = lin_ref(xr).sum()
+        margin_joint = beta * ((c_joint - ref_c) - (r_joint - ref_r))
+        loss_joint = -F.logsigmoid(margin_joint).mean()
+        (loss_joint / grad_accum).backward()
+
+        order: list[str] = []
+        c_seq = lin_seq(xc).sum()
+        r_seq = lin_seq(xr).sum()
+        c_seq.register_hook(lambda _g: order.append("chosen"))
+        r_seq.register_hook(lambda _g: order.append("rejected"))
+
+        loss_seq, c_rew, r_rew, margin_seq = backward_dpo_pair_loss(
+            c_seq, r_seq, ref_c, ref_r, beta=beta, grad_accum_steps=grad_accum
+        )
+        self.assertEqual(order, ["rejected", "chosen"])
+        self.assertAlmostEqual(float(loss_seq.detach()), float(loss_joint.detach()), places=6)
+        self.assertAlmostEqual(float(margin_seq.detach()), float(margin_joint.detach()), places=6)
+        self.assertAlmostEqual(float(c_rew.detach()), float((beta * (c_joint - ref_c)).detach()), places=6)
+        self.assertAlmostEqual(float(r_rew.detach()), float((beta * (r_joint - ref_r)).detach()), places=6)
+        for p_ref, p_seq in zip(lin_ref.parameters(), lin_seq.parameters()):
+            self.assertTrue(torch.allclose(p_ref.grad, p_seq.grad, atol=1e-6))
+
+    def test_grpo_and_eval_generation_pass_logits_to_keep_and_microbatch(self) -> None:
+        import inspect
+        from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+        from eval import benchmark_coding as bc
+        from run_pipeline import build_stage_commands, parse_args
+        from train import grpo_online as go
+        from train.model_loader import install_chunked_causal_lm_loss
+
+        cfg = Gemma4TextConfig(
+            hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2,
+            num_key_value_heads=1, head_dim=16, global_head_dim=16, vocab_size=64,
+            hidden_size_per_layer_input=0, num_kv_shared_layers=0, layer_types=["full_attention"],
+        )
+        m = Gemma4ForCausalLM(cfg).eval()
+        install_chunked_causal_lm_loss(m)
+        self.assertTrue(m._supports_logits_to_keep())
+        self.assertIn("input_ids", inspect.signature(m.forward).parameters)
+
+        class _Tok:
+            pad_token_id = 0
+            eos_token_id = 1
+            padding_side = "right"
+            special_tokens_map = {"sot_token": "<sot>", "eot_token": "<eot>"}
+
+            def convert_tokens_to_ids(self, _t: str) -> int:
+                return 2
+
+            def __call__(self, texts, return_tensors=None, padding=False, truncation=False, max_length=None, add_special_tokens=True):
+                items = [texts] if isinstance(texts, str) else list(texts)
+                seqs = [[(i + 5) % 60 for i in range(max(4, min(200, len(t.split()))))] for t in items]
+                if truncation and max_length:
+                    seqs = [s[:max_length] for s in seqs]
+                width = max(len(s) for s in seqs)
+                padded = [([0] * (width - len(s)) + s) if self.padding_side == "left" else (s + [0] * (width - len(s))) for s in seqs]
+                masks = [([0] * (width - len(s)) + [1] * len(s)) if self.padding_side == "left" else ([1] * len(s) + [0] * (width - len(s))) for s in seqs]
+                return {"input_ids": torch.tensor(padded), "attention_mask": torch.tensor(masks)}
+
+            def decode(self, ids, skip_special_tokens=True) -> str:
+                return f"tok_{len(ids)}"
+
+        calls: list[dict] = []
+        orig_gen = m.generate
+
+        def _spy_gen(*args, **kwargs):
+            calls.append({"shape": tuple(kwargs["input_ids"].shape), "logits_to_keep": kwargs.get("logits_to_keep")})
+            return orig_gen(*args, **kwargs)
+
+        tok = _Tok()
+        long_prompt = "word " * 180
+        with mock.patch.object(m, "generate", side_effect=_spy_gen):
+            outs = go.generate_group_completions(
+                m, tok, long_prompt, num_generations=4, max_new_tokens=32, max_seq_length=96, gen_batch_size=2
+            )
+            self.assertEqual(len(outs), 4)
+            self.assertEqual([c["shape"][0] for c in calls], [2, 2])
+            self.assertTrue(all(c["shape"][1] <= 64 for c in calls))
+            self.assertTrue(all(c["logits_to_keep"] == 1 for c in calls))
+
+            calls.clear()
+            with (
+                mock.patch.object(bc, "HELD_OUT_CODING_SUITE", [{"id": "t1", "language": "go", "category": "fn", "prompt": "hi"}]),
+                mock.patch.object(bc, "verify_code_sample", return_value=SimpleNamespace(passed=True, toolchain="go", diagnostics="OK")),
+            ):
+                res = bc.evaluate_live_compile_pass_at_1(m, tok, max_new_tokens=8, batch_size=1)
+            self.assertEqual(res["passed_count"], 1)
+            self.assertEqual(calls[0]["logits_to_keep"], 1)
+
+        plan = dict(build_stage_commands(parse_args(["--tier", "smoke", "--stages", "grpo"])))
+        self.assertIn("--max-seq-length", plan["grpo"])
+
+    def test_pipeline_tier_eval_steps_scaling(self) -> None:
+        from run_pipeline import build_stage_commands, parse_args
+
+        def _flag(cmd: list[str], name: str) -> str:
+            return cmd[cmd.index(name) + 1]
+
+        for tier, exp_sft, exp_dpo in (("smoke", "5", "5"), ("dev", "50", "30"), ("full", "250", "150")):
+            plan = dict(build_stage_commands(parse_args(["--tier", tier, "--stages", "sft,dpo"])))
+            self.assertEqual(_flag(plan["sft"], "--eval-steps"), exp_sft)
+            self.assertEqual(_flag(plan["dpo"], "--eval-steps"), exp_dpo)
+
+        scaled = dict(build_stage_commands(parse_args(["--tier", "full", "--stages", "sft,dpo", "--sft-steps", "40", "--dpo-steps", "20"])))
+        self.assertEqual(_flag(scaled["sft"], "--eval-steps"), "10")
+        self.assertEqual(_flag(scaled["dpo"], "--eval-steps"), "5")
+
+        explicit = dict(build_stage_commands(parse_args(["--tier", "full", "--stages", "sft,dpo", "--sft-eval-steps", "100", "--dpo-eval-steps", "75"])))
+        self.assertEqual(_flag(explicit["sft"], "--eval-steps"), "100")
+        self.assertEqual(_flag(explicit["dpo"], "--eval-steps"), "75")
+
+    def test_resolve_llama_cpp_paths_and_token_budgets(self) -> None:
+        import inspect
+        from export.multi_engine import resolve_llama_cpp_bin, resolve_llama_cpp_dir, resolve_llama_cpp_script
+        import eval.benchmark_coding as bc
+        import train.grpo_online as go
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            proj_llama = fake_home / "projects" / "llama.cpp"
+            proj_llama.mkdir(parents=True)
+            (proj_llama / "convert_hf_to_gguf.py").write_text("# stub\n")
+            bin_dir = proj_llama / "build" / "bin"
+            bin_dir.mkdir(parents=True)
+            fake_quant = bin_dir / "llama-quantize"
+            fake_quant.write_text("#!/bin/sh\n")
+
+            with (
+                mock.patch.dict(os.environ, {"LLAMA_CPP_DIR": "", "LLAMA_QUANTIZE_BIN": ""}, clear=False),
+                mock.patch("export.multi_engine.Path.home", return_value=fake_home),
+                mock.patch("export.multi_engine.shutil.which", return_value=None),
+            ):
+                self.assertEqual(resolve_llama_cpp_dir(), proj_llama)
+                self.assertEqual(resolve_llama_cpp_script("convert_lora_to_gguf.py"), proj_llama / "convert_lora_to_gguf.py")
+                with mock.patch.dict(os.environ, {"LLAMA_QUANTIZE_BIN": str(fake_quant)}, clear=False):
+                    self.assertEqual(resolve_llama_cpp_bin("llama-quantize", "LLAMA_QUANTIZE_BIN"), fake_quant)
+                if not Path("/usr/local/bin/llama-custom-missing").exists():
+                    custom_bin = bin_dir / "llama-custom-missing"
+                    custom_bin.write_text("#!/bin/sh\n")
+                    self.assertEqual(resolve_llama_cpp_bin("llama-custom-missing"), custom_bin)
+
+            override_dir = fake_home / "custom_llama"
+            with mock.patch.dict(os.environ, {"LLAMA_CPP_DIR": str(override_dir)}, clear=False):
+                self.assertEqual(resolve_llama_cpp_dir(), override_dir)
+                self.assertEqual(resolve_llama_cpp_script("convert_hf_to_gguf.py", "LLAMA_CPP_CONVERT_SCRIPT"), override_dir / "convert_hf_to_gguf.py")
+
+        self.assertGreaterEqual(inspect.signature(bc.evaluate_live_compile_pass_at_1).parameters["max_new_tokens"].default, 512)
+        self.assertGreaterEqual(inspect.signature(go.generate_group_completions).parameters["max_new_tokens"].default, 384)
+
+
+if __name__ == "__main__":
+    unittest.main()

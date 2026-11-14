@@ -32,7 +32,7 @@ import torch
 from peft import PeftModel
 from rich.console import Console
 from rich.table import Table
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -44,25 +44,14 @@ from eval.held_out_prompts import HELD_OUT_CODING_SUITE
 from train.dpo_compiler import _encode_padded_tensors, compute_chunked_sequence_logps, load_dpo_split
 from train.model_loader import (
     DEFAULT_MODEL_ID,
-    build_asymmetric_device_map,
-    install_chunked_causal_lm_loss,
+    get_input_device,
+    load_peft_adapter_preserving_sharding,
+    load_sharded_base_model,
     query_dual_gpu_vram,
-    resolve_checkpoint_id,
+    resolve_model_topology,
 )
-from train.moe_quant import quantize_gemma4_moe_experts_in_place
 
 # Held-out coding prompts live in eval/held_out_prompts.py (5 TS, 5 Go, 5 C#, 5 C/C++).
-
-
-def _align_peft_devices(model: PeftModel) -> None:
-    """Ensure all multi-adapter LoRA parameters sit on the same GPU and bfloat16 dtype as their base_layer."""
-    for module in model.modules():
-        if hasattr(module, "base_layer") and hasattr(module.base_layer, "weight"):
-            dev = module.base_layer.weight.device
-            if hasattr(module, "lora_A"):
-                module.lora_A.to(device=dev, dtype=torch.bfloat16)
-            if hasattr(module, "lora_B"):
-                module.lora_B.to(device=dev, dtype=torch.bfloat16)
 
 
 def load_multi_adapter_benchmark_model(
@@ -70,35 +59,14 @@ def load_multi_adapter_benchmark_model(
 ) -> tuple[PeftModel, PreTrainedTokenizerBase, dict[str, Any]]:
     """Load base model once across cuda:1 + cuda:0 and attach both 'sft' and 'dpo' LoRA adapters."""
     t0 = time.time()
-    resolved_id = resolve_checkpoint_id(model_id)
-    cfg = AutoConfig.from_pretrained(resolved_id)
-    model_type = getattr(cfg, "model_type", "gemma4")
-    text_cfg = cfg.get_text_config() if hasattr(cfg, "get_text_config") else cfg
-    num_layers = getattr(text_cfg, "num_hidden_layers", 42)
-    is_moe = bool(getattr(text_cfg, "enable_moe_block", False) or getattr(text_cfg, "num_experts", 0) > 1)
-    split_layer = 21 if num_layers <= 30 else 26
-    device_map = build_asymmetric_device_map(
-        model_type=model_type, num_layers=num_layers, primary_gpu_max_layer=split_layer,
-        offload_multimodal=bool(load_in_4bit or is_moe), offload_experts_to_cpu=bool(load_in_4bit and is_moe),
+    topo = resolve_model_topology(model_id=model_id, attn_implementation="sdpa", load_in_4bit=load_in_4bit)
+    resolved_id, model_type = topo["resolved_id"], topo["model_type"]
+    base_model, tokenizer = load_sharded_base_model(
+        topo, tokenizer_source=dpo_adapter_dir, load_in_4bit=load_in_4bit, console=console
     )
-    attn_arg = {"text_config": "sdpa", "vision_config": "sdpa", "audio_config": "eager"} if model_type == "gemma4" else "sdpa"
-    tokenizer = AutoTokenizer.from_pretrained(str(dpo_adapter_dir))
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    load_kw: dict[str, Any] = {"dtype": torch.bfloat16, "device_map": device_map, "attn_implementation": attn_arg}
-    if load_in_4bit:
-        load_kw["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16, llm_int8_enable_fp32_cpu_offload=True,
-        )
-    base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(resolved_id, **load_kw)
-    if load_in_4bit and is_moe:
-        quantize_gemma4_moe_experts_in_place(base_model, layer_device_map={i: (1 if i <= split_layer else 0) for i in range(num_layers)})
-    install_chunked_causal_lm_loss(base_model, chunk_size=256)
 
-    peft_model = PeftModel.from_pretrained(base_model, str(sft_adapter_dir), adapter_name="sft", is_trainable=False)
-    peft_model.load_adapter(str(dpo_adapter_dir), adapter_name="dpo", is_trainable=False)
-    _align_peft_devices(peft_model)
+    peft_model = load_peft_adapter_preserving_sharding(base_model, sft_adapter_dir, adapter_name="sft", is_trainable=False)
+    peft_model = load_peft_adapter_preserving_sharding(peft_model, dpo_adapter_dir, adapter_name="dpo", is_trainable=False)
     peft_model.eval()
     return peft_model, tokenizer, {
         "resolved_model_id": resolved_id, "model_type": model_type, "load_in_4bit": load_in_4bit,
@@ -193,13 +161,13 @@ def evaluate_compiler_preference(
 
 @torch.no_grad()
 def evaluate_live_compile_pass_at_1(
-    model: PeftModel, tokenizer: PreTrainedTokenizerBase, max_new_tokens: int = 192, batch_size: int = 5
+    model: PeftModel, tokenizer: PreTrainedTokenizerBase, max_new_tokens: int = 512, batch_size: int = 5
 ) -> dict[str, Any]:
     """Run deterministic greedy decoding (do_sample=False) across HELD_OUT_CODING_SUITE and verify in compiler sandbox."""
     causal_lm = model.get_base_model() if hasattr(model, "get_base_model") else model
     sot = str(tokenizer.special_tokens_map.get("sot_token", "<start_of_turn>"))
     eot = str(tokenizer.special_tokens_map.get("eot_token", "<end_of_turn>"))
-    first_dev = next(causal_lm.model.parameters()).device
+    first_dev = get_input_device(causal_lm)
 
     orig_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
@@ -228,15 +196,19 @@ def evaluate_live_compile_pass_at_1(
                 do_sample=False,
                 pad_token_id=int(tokenizer.pad_token_id or 0),
                 eos_token_id=eos_ids if eos_ids else None,
+                logits_to_keep=1,
                 use_cache=True,
             )
             for idx in range(len(batch_items)):
                 generations.append(tokenizer.decode(out_ids[idx, in_ids.size(1) :], skip_special_tokens=True).strip())
+            del out_ids
     finally:
         tokenizer.padding_side = orig_padding_side
         causal_lm.config.use_cache = False
         if hasattr(causal_lm.config, "text_config"):
             causal_lm.config.text_config.use_cache = False
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     gen_elapsed = round(time.time() - t_gen, 2)
 
@@ -291,7 +263,7 @@ def main() -> int:
     parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--sft-adapter", default=None)
     parser.add_argument("--dpo-adapter", default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=192)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--output-path", default=None)
     args = parser.parse_args()
 
@@ -339,7 +311,7 @@ def main() -> int:
     dpo_gen = evaluate_live_compile_pass_at_1(model, tokenizer, max_new_tokens=args.max_new_tokens)
 
     results = {
-        "base": {"label": "Base (gemma-4-E4B-it)", "perplexity": base_ppl, "preference": base_pref, "live_coding": base_gen},
+        "base": {"label": f"Base ({args.model_id.split('/')[-1]})", "perplexity": base_ppl, "preference": base_pref, "live_coding": base_gen},
         "sft": {"label": f"Phase 3 SFT ({sft_dir.parent.name})", "perplexity": sft_ppl, "preference": sft_pref, "live_coding": sft_gen},
         "dpo": {"label": f"Phase 4 SFT+DPO ({dpo_dir.parent.name})", "perplexity": dpo_ppl, "preference": dpo_pref, "live_coding": dpo_gen},
     }

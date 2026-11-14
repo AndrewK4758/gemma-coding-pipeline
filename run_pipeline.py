@@ -34,10 +34,19 @@ VALID_STAGES = ("data", "sft", "dpo", "grpo", "eval", "export")
 GPU_STAGES = {"sft", "dpo", "grpo", "eval", "export"}
 
 TIER_DEFAULTS: dict[str, dict[str, int]] = {
-    "smoke": {"sft_steps": 15, "dpo_steps": 15, "grpo_steps": 2, "max_seq_len": 4096},
-    "dev": {"sft_steps": 180, "dpo_steps": 120, "grpo_steps": 20, "max_seq_len": 4096},
-    "full": {"sft_steps": -1, "dpo_steps": 600, "grpo_steps": 50, "max_seq_len": 8192},
+    "smoke": {"sft_steps": 15, "sft_eval_steps": 5, "dpo_steps": 15, "dpo_eval_steps": 5, "grpo_steps": 2, "max_seq_len": 4096},
+    "dev": {"sft_steps": 180, "sft_eval_steps": 50, "dpo_steps": 120, "dpo_eval_steps": 30, "grpo_steps": 20, "max_seq_len": 4096},
+    "full": {"sft_steps": -1, "sft_eval_steps": 250, "dpo_steps": 600, "dpo_eval_steps": 150, "grpo_steps": 50, "max_seq_len": 8192},
 }
+
+
+def _resolve_eval_steps(eval_override: int | None, tier_default: int, step_override: int | None) -> int:
+    """Return a positive validation cadence, scaling down when max_steps is overridden below tier defaults."""
+    if eval_override is not None:
+        return max(1, eval_override)
+    if step_override is not None and step_override > 0:
+        return max(1, min(tier_default, max(1, step_override // 4)))
+    return tier_default
 
 
 def switch_gpu_mode(mode: str, console: Console) -> None:
@@ -94,7 +103,9 @@ def build_stage_commands(args: argparse.Namespace) -> list[tuple[str, list[str]]
     data_dir = str(resolve_processed_dir(args.tier, domain=domain, oss_only=oss_only))
 
     sft_steps = args.sft_steps if args.sft_steps is not None else t_cfg["sft_steps"]
+    sft_eval_steps = _resolve_eval_steps(getattr(args, "sft_eval_steps", None), t_cfg["sft_eval_steps"], args.sft_steps)
     dpo_steps = args.dpo_steps if args.dpo_steps is not None else t_cfg["dpo_steps"]
+    dpo_eval_steps = _resolve_eval_steps(getattr(args, "dpo_eval_steps", None), t_cfg["dpo_eval_steps"], args.dpo_steps)
     grpo_steps = args.grpo_steps if args.grpo_steps is not None else t_cfg["grpo_steps"]
     seq_len = args.max_seq_length if args.max_seq_length is not None else (
         min(4096, t_cfg["max_seq_len"]) if is_26b else t_cfg["max_seq_len"]
@@ -129,6 +140,7 @@ def build_stage_commands(args: argparse.Namespace) -> list[tuple[str, list[str]]
                     [
                         py, "train/sft_lora.py", *shared_train,
                         "--max-seq-length", str(seq_len), "--max-steps", str(sft_steps),
+                        "--eval-steps", str(sft_eval_steps),
                         "--learning-rate", sft_lr, "--gradient-accumulation-steps", grad_accum,
                     ],
                 )
@@ -140,6 +152,7 @@ def build_stage_commands(args: argparse.Namespace) -> list[tuple[str, list[str]]
                     [
                         py, "train/dpo_compiler.py", *shared_train,
                         "--max-seq-length", str(seq_len), "--max-steps", str(dpo_steps),
+                        "--eval-steps", str(dpo_eval_steps),
                         "--learning-rate", dpo_lr,
                     ],
                 )
@@ -148,7 +161,7 @@ def build_stage_commands(args: argparse.Namespace) -> list[tuple[str, list[str]]
             plan.append(
                 (
                     "grpo",
-                    [py, "train/grpo_online.py", *shared_train, "--max-steps", str(grpo_steps)],
+                    [py, "train/grpo_online.py", *shared_train, "--max-seq-length", str(seq_len), "--max-steps", str(grpo_steps)],
                 )
             )
         elif stage == "eval":
@@ -179,7 +192,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--load-in-4bit", action="store_true", help="Enable 4-bit NF4 QLoRA loading (auto on 26B-A4B).")
     parser.add_argument("--sft-steps", type=int, default=None, help="Override SFT max_steps.")
+    parser.add_argument("--sft-eval-steps", type=int, default=None, help="Override SFT validation cadence in global steps.")
     parser.add_argument("--dpo-steps", type=int, default=None, help="Override DPO max_steps.")
+    parser.add_argument("--dpo-eval-steps", type=int, default=None, help="Override DPO validation cadence in global steps.")
     parser.add_argument("--grpo-steps", type=int, default=None, help="Override GRPO max_steps.")
     parser.add_argument("--max-seq-length", type=int, default=None, help="Override max sequence length.")
     parser.add_argument("--dry-run", action="store_true", help="Print stage execution plan without running.")

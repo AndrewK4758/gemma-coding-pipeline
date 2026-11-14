@@ -45,6 +45,7 @@ if str(REPO_ROOT) not in sys.path:
 from data.build_dataset import format_gemma2_chat_and_mask_labels, format_gemma_messages_and_mask_labels
 from train.model_loader import (
     DEFAULT_MODEL_ID,
+    get_input_device,
     load_sharded_lora_model_and_tokenizer,
     query_dual_gpu_vram,
 )
@@ -96,7 +97,7 @@ def compute_chunked_sequence_logps(
             logits_chunk = torch.tanh(logits_chunk / softcap) * softcap
         return -F.cross_entropy(logits_chunk.float(), y_chunk, reduction="sum")
 
-    first_dev = next(causal_lm.model.parameters()).device
+    first_dev = get_input_device(causal_lm)
     outputs = causal_lm.model(
         input_ids=input_ids.to(first_dev),
         attention_mask=attention_mask.to(first_dev),
@@ -144,40 +145,67 @@ def load_dpo_split(parquet_path: Path, tokenizer: PreTrainedTokenizerBase, max_s
     for row in pq.read_table(parquet_path).to_pylist():
         c_ids, c_mask, c_lbls = _encode_padded_tensors(row["prompt"], row["chosen"], tokenizer, max_seq_length)
         r_ids, r_mask, r_lbls = _encode_padded_tensors(row["prompt"], row["rejected"], tokenizer, max_seq_length)
-        samples.append(
-            {
-                "id": row["id"],
-                "language": row["language"],
-                "chosen_input_ids": c_ids,
-                "chosen_attention_mask": c_mask,
-                "chosen_labels": c_lbls,
-                "rejected_input_ids": r_ids,
-                "rejected_attention_mask": r_mask,
-                "rejected_labels": r_lbls,
-                "ref_chosen_logp": None,
-                "ref_rejected_logp": None,
-            }
-        )
+        samples.append({
+            "id": row["id"], "language": row["language"],
+            "chosen_input_ids": c_ids, "chosen_attention_mask": c_mask, "chosen_labels": c_lbls,
+            "rejected_input_ids": r_ids, "rejected_attention_mask": r_mask, "rejected_labels": r_lbls,
+            "ref_chosen_logp": None, "ref_rejected_logp": None,
+        })
     return samples
+
+
+def backward_dpo_pair_loss(
+    pol_c_lp: torch.Tensor,
+    pol_r_lp: torch.Tensor,
+    ref_chosen_logp: float,
+    ref_rejected_logp: float,
+    beta: float,
+    grad_accum_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backprop DPO pair loss sequentially through rejected then chosen graphs.
+
+    Multi-GPU PyTorch autograd runs per-device worker threads; backwarding two
+    checkpointed subgraphs concurrently races cross-GPU RNG restoration during
+    recomputation and diverges MoE top-k routing when dropout is active.
+    """
+    ref_c = torch.tensor([ref_chosen_logp], device=pol_c_lp.device, dtype=torch.float32)
+    ref_r = torch.tensor([ref_rejected_logp], device=pol_r_lp.device, dtype=torch.float32)
+    c_det = pol_c_lp.detach().requires_grad_(pol_c_lp.requires_grad)
+    r_det = pol_r_lp.detach().requires_grad_(pol_r_lp.requires_grad)
+    c_rew = beta * (c_det - ref_c)
+    r_rew = beta * (r_det - ref_r)
+    margin = c_rew - r_rew.to(c_rew.device)
+    pair_loss = -F.logsigmoid(margin).mean()
+    d_c, d_r = torch.autograd.grad(pair_loss / max(1, grad_accum_steps), (c_det, r_det))
+    if pol_r_lp.requires_grad:
+        pol_r_lp.backward(gradient=d_r)
+    if pol_c_lp.requires_grad:
+        pol_c_lp.backward(gradient=d_c)
+    return pair_loss.detach(), c_rew.detach(), r_rew.detach(), margin.detach()
+
+
+def _norm_logp(seq_lp: torch.Tensor, tok_cnt: torch.Tensor) -> torch.Tensor:
+    """Normalize sequence sum log-probability by completion token count for length invariance."""
+    return seq_lp / tok_cnt.to(device=seq_lp.device, dtype=seq_lp.dtype).clamp_min(1)
 
 
 @torch.no_grad()
 def precompute_reference_logps(
     model: PeftModel, samples: list[dict[str, Any]], ref_mode: str, desc: str, console: Console
 ) -> None:
-    """Pre-compute reference log-probs in torch.no_grad() using either the initial SFT adapter or disable_adapter()."""
+    """Pre-compute length-normalized reference log-probs using the initial adapter or disable_adapter()."""
     model.eval()
     t_start = time.time()
     for s in samples:
         if ref_mode == "disable_adapter":
             with model.disable_adapter():
-                c_lp, _ = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
-                r_lp, _ = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
+                c_lp, c_cnt = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
+                r_lp, r_cnt = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
         else:
-            c_lp, _ = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
-            r_lp, _ = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
-        s["ref_chosen_logp"] = float(c_lp.item())
-        s["ref_rejected_logp"] = float(r_lp.item())
+            c_lp, c_cnt = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
+            r_lp, r_cnt = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
+        s["ref_chosen_logp"] = float(_norm_logp(c_lp, c_cnt).item())
+        s["ref_rejected_logp"] = float(_norm_logp(r_lp, r_cnt).item())
     console.print(f"    Cached reference log-probs for [green]{len(samples)}[/green] {desc} pairs (mode={ref_mode}, {time.time() - t_start:.1f}s)")
 
 
@@ -185,35 +213,29 @@ def precompute_reference_logps(
 def evaluate_dpo(
     model: PeftModel, eval_samples: list[dict[str, Any]], beta: float, step: int, tb_writer: SummaryWriter
 ) -> dict[str, float]:
-    """Evaluate DPO loss, implicit rewards, reward margins, and preference accuracy on held-out eval split."""
+    """Evaluate length-normalized DPO loss, implicit rewards, reward margins, and preference accuracy."""
     model.eval()
     losses, c_rews, r_rews, margins, accs, c_logps, r_logps, logp_accs = [], [], [], [], [], [], [], []
     for s in eval_samples:
         pol_c_lp, c_cnt = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
         pol_r_lp, r_cnt = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
-        pol_c, pol_r = float(pol_c_lp.item()), float(pol_r_lp.item())
+        pol_c = float(_norm_logp(pol_c_lp, c_cnt).item())
+        pol_r = float(_norm_logp(pol_r_lp, r_cnt).item())
         c_rew = beta * (pol_c - float(s["ref_chosen_logp"]))
         r_rew = beta * (pol_r - float(s["ref_rejected_logp"]))
         margin = c_rew - r_rew
         losses.append(float(-F.logsigmoid(torch.tensor(margin, dtype=torch.float32)).item()))
-        c_rews.append(c_rew)
-        r_rews.append(r_rew)
-        margins.append(margin)
+        c_rews.append(c_rew); r_rews.append(r_rew); margins.append(margin)
         accs.append(1.0 if margin > 1e-7 else 0.0)
-        c_logps.append(pol_c)
-        r_logps.append(pol_r)
-        logp_accs.append(1.0 if (pol_c / c_cnt.item()) > (pol_r / r_cnt.item()) else 0.0)
+        c_logps.append(pol_c); r_logps.append(pol_r)
+        logp_accs.append(1.0 if pol_c > pol_r else 0.0)
 
     n = max(len(eval_samples), 1)
     metrics = {
-        "step": step,
-        "eval_loss": round(sum(losses) / n, 4),
-        "rewards/chosen": round(sum(c_rews) / n, 4),
-        "rewards/rejected": round(sum(r_rews) / n, 4),
-        "rewards/margins": round(sum(margins) / n, 4),
-        "rewards/accuracies": round(sum(accs) / n, 4),
-        "logps/chosen": round(sum(c_logps) / n, 4),
-        "logps/rejected": round(sum(r_logps) / n, 4),
+        "step": step, "eval_loss": round(sum(losses) / n, 4),
+        "rewards/chosen": round(sum(c_rews) / n, 4), "rewards/rejected": round(sum(r_rews) / n, 4),
+        "rewards/margins": round(sum(margins) / n, 4), "rewards/accuracies": round(sum(accs) / n, 4),
+        "logps/chosen": round(sum(c_logps) / n, 4), "logps/rejected": round(sum(r_logps) / n, 4),
         "logps/accuracies": round(sum(logp_accs) / n, 4),
     }
     for k, v in metrics.items():
@@ -232,7 +254,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sft-adapter", default=None)
     parser.add_argument("--max-seq-length", type=int, default=4096)
     parser.add_argument("--max-steps", type=int, default=15)
-    parser.add_argument("--beta", type=float, default=0.1)
+    parser.add_argument("--beta", type=float, default=2.0)
     parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--eval-steps", type=int, default=5)
@@ -284,9 +306,7 @@ def main() -> int:
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = bnb.optim.PagedAdamW8bit(trainable_params, lr=args.learning_rate, weight_decay=0.01)
     total_steps = args.max_steps if args.max_steps > 0 else max(1, len(active_train) // args.gradient_accumulation_steps)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=max(1, int(round(0.1 * total_steps))), num_training_steps=total_steps
-    )
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=max(1, int(round(0.1 * total_steps))), num_training_steps=total_steps)
 
     step_history: list[dict[str, Any]] = []
     eval_history: list[dict[str, Any]] = [pre_eval]
@@ -300,23 +320,17 @@ def main() -> int:
         for _ in range(args.gradient_accumulation_steps):
             s = active_train[sample_idx % len(active_train)]
             sample_idx += 1
-            pol_c_lp, _ = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
-            pol_r_lp, _ = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
-            ref_c = torch.tensor([s["ref_chosen_logp"]], device=pol_c_lp.device, dtype=torch.float32)
-            ref_r = torch.tensor([s["ref_rejected_logp"]], device=pol_r_lp.device, dtype=torch.float32)
+            pol_c_lp, c_cnt = compute_chunked_sequence_logps(model, s["chosen_input_ids"], s["chosen_attention_mask"], s["chosen_labels"])
+            pol_r_lp, r_cnt = compute_chunked_sequence_logps(model, s["rejected_input_ids"], s["rejected_attention_mask"], s["rejected_labels"])
+            norm_c_lp, norm_r_lp = _norm_logp(pol_c_lp, c_cnt), _norm_logp(pol_r_lp, r_cnt)
+            pair_loss, c_rew, r_rew, margin = backward_dpo_pair_loss(
+                norm_c_lp, norm_r_lp, float(s["ref_chosen_logp"]), float(s["ref_rejected_logp"]),
+                args.beta, args.gradient_accumulation_steps,
+            )
 
-            c_rew, r_rew = args.beta * (pol_c_lp - ref_c), args.beta * (pol_r_lp - ref_r)
-            margin = c_rew - r_rew
-            pair_loss = -F.logsigmoid(margin).mean()
-            (pair_loss / args.gradient_accumulation_steps).backward()
-
-            s_loss.append(float(pair_loss.item()))
-            s_cr.append(float(c_rew.item()))
-            s_rr.append(float(r_rew.item()))
-            s_m.append(float(margin.item()))
-            s_acc.append(1.0 if float(margin.item()) > 0.0 else 0.0)
-            s_clp.append(float(pol_c_lp.item()))
-            s_rlp.append(float(pol_r_lp.item()))
+            s_loss.append(float(pair_loss.item())); s_cr.append(float(c_rew.item())); s_rr.append(float(r_rew.item()))
+            s_m.append(float(margin.item())); s_acc.append(1.0 if float(margin.item()) > 0.0 else 0.0)
+            s_clp.append(float(norm_c_lp.detach().item())); s_rlp.append(float(norm_r_lp.detach().item()))
 
         grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0).item())
         lr_now = float(scheduler.get_last_lr()[0])
@@ -328,25 +342,18 @@ def main() -> int:
         c1_peak = float(vram.get("cuda:1", {}).get("peak_allocated_mib", 0.0))
         k = args.gradient_accumulation_steps
         entry = {
-            "step": step,
-            "loss": round(sum(s_loss) / k, 4),
-            "rewards/chosen": round(sum(s_cr) / k, 4),
-            "rewards/rejected": round(sum(s_rr) / k, 4),
-            "rewards/margins": round(sum(s_m) / k, 4),
-            "rewards/accuracies": round(sum(s_acc) / k, 4),
-            "logps/chosen": round(sum(s_clp) / k, 4),
-            "logps/rejected": round(sum(s_rlp) / k, 4),
-            "grad_norm": round(grad_norm, 4),
-            "learning_rate": lr_now,
-            "cuda0_peak_mib": c0_peak,
-            "cuda1_peak_mib": c1_peak,
+            "step": step, "loss": round(sum(s_loss) / k, 4),
+            "rewards/chosen": round(sum(s_cr) / k, 4), "rewards/rejected": round(sum(s_rr) / k, 4),
+            "rewards/margins": round(sum(s_m) / k, 4), "rewards/accuracies": round(sum(s_acc) / k, 4),
+            "logps/chosen": round(sum(s_clp) / k, 4), "logps/rejected": round(sum(s_rlp) / k, 4),
+            "grad_norm": round(grad_norm, 4), "learning_rate": lr_now,
+            "cuda0_peak_mib": c0_peak, "cuda1_peak_mib": c1_peak,
         }
         step_history.append(entry)
         for mk in ("loss", "rewards/chosen", "rewards/rejected", "rewards/margins", "rewards/accuracies", "grad_norm"):
             tb_writer.add_scalar(f"train/{mk.replace('/', '_')}", entry[mk], step)
-        tb_writer.add_scalar("train/learning_rate", lr_now, step)
-        tb_writer.add_scalar("vram/cuda0_peak_mib", c0_peak, step)
-        tb_writer.add_scalar("vram/cuda1_peak_mib", c1_peak, step)
+        for tag, val in (("train/learning_rate", lr_now), ("vram/cuda0_peak_mib", c0_peak), ("vram/cuda1_peak_mib", c1_peak)):
+            tb_writer.add_scalar(tag, val, step)
 
         console.print(
             f"[cyan][DPO Step {step:02d}/{total_steps:02d}][/cyan] loss=[bold green]{entry['loss']:.4f}[/bold green] | "
@@ -372,14 +379,13 @@ def main() -> int:
 
     payload = {
         "tier": args.tier, "elapsed_sec": round(time.time() - t0, 2), "beta": args.beta, "ref_mode": args.ref_mode,
-        "sft_adapter_dir": str(sft_adapter_dir), "final_adapter_dir": str(final_adapter_dir),
-        "max_steps": total_steps, "gradient_accumulation_steps": args.gradient_accumulation_steps,
-        "learning_rate": args.learning_rate, "pre_dpo_eval": pre_eval, "post_dpo_eval": post_eval,
-        "eval_loss_delta": round(post_eval["eval_loss"] - pre_eval["eval_loss"], 4),
+        "sft_adapter_dir": str(sft_adapter_dir), "final_adapter_dir": str(final_adapter_dir), "max_steps": total_steps,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps, "learning_rate": args.learning_rate,
+        "pre_dpo_eval": pre_eval, "post_dpo_eval": post_eval, "step_telemetry": step_history, "eval_telemetry": eval_history,
+        "eval_loss_delta": round(post_eval["eval_loss"] - pre_eval["eval_loss"], 4), "model_meta": load_meta,
         "reward_margin_delta": round(post_eval["rewards/margins"] - pre_eval["rewards/margins"], 4),
         "reward_accuracy_delta": round(post_eval["rewards/accuracies"] - pre_eval["rewards/accuracies"], 4),
-        "step_telemetry": step_history, "eval_telemetry": eval_history,
-        "final_vram": query_dual_gpu_vram(), "model_meta": load_meta,
+        "final_vram": query_dual_gpu_vram(),
     }
     metrics_path = output_dir / "dpo_metrics.json"
     metrics_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
