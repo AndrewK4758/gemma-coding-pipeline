@@ -48,8 +48,9 @@ cd gemma-coding-pipeline
 .venv/bin/python run_pipeline.py --tier dev --domain go     --adapter-name go     --oss-only --stages data,sft,dpo,grpo,eval,export
 .venv/bin/python run_pipeline.py --tier dev --domain cpp    --adapter-name cpp    --oss-only --stages data,sft,dpo,grpo,eval,export
 
-# 5. Optional 26B-A4B MoE QLoRA run (auto-enables 4-bit NF4 experts + streaming CPU merge)
-.venv/bin/python run_pipeline.py --tier dev --model-id google/gemma-4-26B-A4B-it --load-in-4bit --domain all --stages data,sft,dpo,eval,export
+# 5. Optional 26B-A4B MoE QLoRA run (all 4 languages unified or per-domain; auto-enables 4-bit NF4 experts + streaming CPU merge)
+./scripts/train_26b_all_languages.zsh --tier dev --mode unified
+./scripts/train_26b_all_languages.zsh --tier dev --mode per-domain
 ```
 
 Monitor training curves in real time with local TensorBoard:
@@ -255,6 +256,7 @@ curl -s http://127.0.0.1:11434/v1/chat/completions \
 | [`scripts/gpu-mode.zsh`](scripts/gpu-mode.zsh) | Switches Dual GPUs between `train` mode (`$LOCAL_OFFLOAD_SERVICE` stopped) and `inference` / `serve` mode (`:11434` health-checked). |
 | [`scripts/clone_oss_corpus.zsh`](scripts/clone_oss_corpus.zsh) | Shallow-clones curated MIT/Apache-2.0/BSD-3 `.NET`, `React UI`, `Go`, and `C/C++` repositories (`--depth=500`) and warms package caches offline. |
 | [`scripts/verify_dual_gpu_sharding.py`](scripts/verify_dual_gpu_sharding.py) | Phase 1 hardware probe verifying Dual-GPU compute capability, asymmetric `device_map`, cross-PCIe autograd, and `PagedAdamW8bit`. |
+| [`scripts/train_26b_all_languages.zsh`](scripts/train_26b_all_languages.zsh) | All-language (`dotnet`, `react`, `go`, `cpp`) runner for `26B-A4B-it` and `E4B-it` (`unified`, `oss-unified`, `per-domain`, `all`). |
 | [`data/mine_oss_repos.py`](data/mine_oss_repos.py) | Mines atomic `impl + test` commits into Gemma 4 `<\|channel>thought` SFT, DPO, and GRPO JSONLs (combined and domain-split). |
 | [`data/ingest_sources.py`](data/ingest_sources.py) | Streams Hugging Face coding datasets, harvests `$LOCAL_PROJECTS_ROOT`, and merges mined `.NET`/`React`/`Go`/`C++` OSS commits. |
 | [`data/dedup_and_filter.py`](data/dedup_and_filter.py) | Heuristic quality filter + `datasketch` 5-gram `MinHash LSH` + `:11434` semantic deduplication. |
@@ -266,5 +268,5 @@ curl -s http://127.0.0.1:11434/v1/chat/completions \
 | [`train/grpo_online.py`](train/grpo_online.py) | Phase 4B Online GRPO trainer with snippet compiler and live OSS git-worktree test grading. |
 | [`eval/benchmark_coding.py`](eval/benchmark_coding.py) | Phase 5 multi-adapter single-load benchmark (`Base` vs. `SFT` vs. `DPO`/`GRPO`). |
 | [`export/merge_and_quantize_gguf.py`](export/merge_and_quantize_gguf.py) & [`export/multi_engine.py`](export/multi_engine.py) | Streaming shard-by-shard CPU LoRA merge, `Q8_0`/`Q4_K_M-imatrix` GGUFs, standalone `lora-*.gguf`, Ollama `Modelfile`, and `vLLM` launcher. |
-| [`tests/test_oss_pipeline.py`](tests/test_oss_pipeline.py) & [`tests/test_go_cpp_pipeline.py`](tests/test_go_cpp_pipeline.py) | Automated unit and synthetic-model smoke tests covering `.NET`/`React`/`Go`/`C++` mining, worktree sandboxes, 4-bit MoE, masking, and export. |
+| [`tests/`](tests/) | Automated unit and synthetic-model regression tests (`test_oss_pipeline.py`, `test_go_cpp_pipeline.py`, `test_dotnet_sdk_routing.py`, `test_model_loading_and_export.py`). |
 | [`run_pipeline.py`](run_pipeline.py) | Top-level end-to-end CLI orchestrator (`--tier`, `--stages`, `--domain`, `--adapter-name`, `--oss-only`, `--load-in-4bit`). |

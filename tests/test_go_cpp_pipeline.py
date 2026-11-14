@@ -300,6 +300,49 @@ class TestGoCppPipeline(unittest.TestCase):
             self.assertEqual(meta["samples_included"], 4)
             self.assertEqual(meta["per_language_counts"]["cpp"], 1)
 
+    def test_dpo_length_normalization_and_hard_oss_negative(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+        import torch
+        from data.mine_oss_repos import to_dpo_record
+        from train.dpo_compiler import evaluate_dpo, precompute_reference_logps
+
+        commit = {
+            "ecosystem": "go", "language": "go", "repo_name": "acme/pkg", "repo_path": "/tmp/r",
+            "sha": "abc123456789", "parent_sha": "def987654321", "subject": "Fix bounds check",
+            "impl_files": ["math.go"], "test_files": ["math_test.go"], "parent_excerpt": "",
+            "diff": "diff --git a/math.go b/math.go\n--- a/math.go\n+++ b/math.go\n@@ -1,4 +1,6 @@\n func Clamp(x int) int {\n+\tif x < 0 { return 0 }\n+\treturn x\n }\n",
+        }
+        rec = to_dpo_record(commit)
+        self.assertIn("<|channel>thought", rec["rejected"])
+        self.assertNotIn("Modifying math.go quickly.", rec["rejected"])
+        self.assertGreater(len(rec["rejected"]), int(0.5 * len(rec["chosen"])))
+
+        fake_sample = {
+            "chosen_input_ids": torch.ones(1, 10, dtype=torch.long),
+            "chosen_attention_mask": torch.ones(1, 10, dtype=torch.long),
+            "chosen_labels": torch.ones(1, 10, dtype=torch.long),
+            "rejected_input_ids": torch.ones(1, 4, dtype=torch.long),
+            "rejected_attention_mask": torch.ones(1, 4, dtype=torch.long),
+            "rejected_labels": torch.ones(1, 4, dtype=torch.long),
+            "ref_chosen_logp": None,
+            "ref_rejected_logp": None,
+        }
+
+        class _FakeModel:
+            def eval(self):
+                return self
+
+        writer = SimpleNamespace(add_scalar=lambda *_a, **_k: None)
+        side = [(torch.tensor([-1000.0]), torch.tensor(1000.0)), (torch.tensor([-100.0]), torch.tensor(100.0))] * 2
+        with mock.patch("train.dpo_compiler.compute_chunked_sequence_logps", side_effect=side):
+            precompute_reference_logps(_FakeModel(), [fake_sample], "precompute_sft", "eval", SimpleNamespace(print=lambda *_a: None))
+            self.assertAlmostEqual(fake_sample["ref_chosen_logp"], -1.0, places=5)
+            self.assertAlmostEqual(fake_sample["ref_rejected_logp"], -1.0, places=5)
+            ev = evaluate_dpo(_FakeModel(), [fake_sample], beta=2.0, step=0, tb_writer=writer)
+            self.assertAlmostEqual(ev["logps/chosen"], -1.0, places=5)
+            self.assertAlmostEqual(ev["rewards/margins"], 0.0, places=5)
+
 
 if __name__ == "__main__":
     unittest.main()

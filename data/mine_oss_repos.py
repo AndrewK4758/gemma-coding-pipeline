@@ -247,20 +247,21 @@ def to_sft_record(commit: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _degrade_diff_with_placeholder(patch: str, impl_files: list[str]) -> str:
+def _degrade_diff_with_placeholder(patch: str, impl_files: list[str], thought: str = "") -> str:
     target = impl_files[0] if impl_files else "src/Target.code"
-    first_hunk = next((ln for ln in patch.splitlines() if ln.startswith("@@")), "@@ -1,3 +1,3 @@")
-    return (
-        f"<|channel>thought\nModifying {target} quickly.\n<channel|>\n"
-        f"```diff\ndiff --git a/{target} b/{target}\n"
-        f"--- a/{target}\n+++ b/{target}\n{first_hunk}\n"
-        f"+{LAZY_PLACEHOLDER}\n```"
-    )
+    lines = [ln for ln in patch.splitlines() if ln]
+    cutoff = min(len(lines) - 1, max(4, (len(lines) * 3) // 4)) if len(lines) > 1 else len(lines)
+    kept = lines[:cutoff]
+    if not any(ln.startswith("@@") for ln in kept):
+        kept = [f"diff --git a/{target} b/{target}", f"--- a/{target}", f"+++ b/{target}", "@@ -1,3 +1,3 @@"]
+    hdr = thought.strip() or f"Let's implement the change cleanly for {target}."
+    return f"<|channel>thought\n{hdr}\n<channel|>\n```diff\n" + "\n".join(kept) + f"\n+{LAZY_PLACEHOLDER}\n```"
 
 
 def to_dpo_record(commit: dict[str, Any]) -> dict[str, Any]:
     """Convert an atomic OSS commit into a DPO preference pair rejecting truncated diffs."""
     sft = to_sft_record(commit)
+    thought = sft["response"].split("<|channel>thought\n", 1)[-1].split("\n<channel|>", 1)[0]
     return {
         "id": f"dpo_{sft['id']}",
         "source": "oss_commits",
@@ -271,7 +272,7 @@ def to_dpo_record(commit: dict[str, Any]) -> dict[str, Any]:
         "commit_sha": commit["sha"],
         "prompt": sft["instruction"],
         "chosen": sft["response"],
-        "rejected": _degrade_diff_with_placeholder(commit["diff"], commit["impl_files"]),
+        "rejected": _degrade_diff_with_placeholder(commit["diff"], commit["impl_files"], thought=thought),
         "compiler_toolchain": f"oss-{commit['ecosystem']}-diff",
         "compiler_feedback": f"Rejected truncated placeholder diff for {commit['repo_name']} ({commit['sha'][:8]})",
     }
